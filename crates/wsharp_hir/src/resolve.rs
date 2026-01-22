@@ -81,6 +81,8 @@ pub struct Scope {
     variables: HashMap<String, Symbol>,
     /// Type bindings.
     types: HashMap<String, Symbol>,
+    /// Function overloads (multiple functions can have the same name).
+    function_overloads: HashMap<String, Vec<Symbol>>,
     /// Whether this is a function scope (for return checking).
     is_function: bool,
     /// Whether this is a loop scope (for break/continue checking).
@@ -268,8 +270,27 @@ impl Resolver {
     /// Define a type in the current scope.
     pub fn define_type(&mut self, name: String, symbol: Symbol) {
         if let Some(scope) = self.scopes.last_mut() {
+            // For functions, track all overloads
+            if matches!(&symbol, Symbol::Function { .. }) {
+                scope
+                    .function_overloads
+                    .entry(name.clone())
+                    .or_default()
+                    .push(symbol.clone());
+            }
             scope.types.insert(name, symbol);
         }
+    }
+
+    /// Get all function overloads for a name.
+    pub fn lookup_function_overloads(&self, name: &str) -> Vec<&Symbol> {
+        let mut overloads = Vec::new();
+        for scope in self.scopes.iter().rev() {
+            if let Some(symbols) = scope.function_overloads.get(name) {
+                overloads.extend(symbols.iter());
+            }
+        }
+        overloads
     }
 
     /// Look up a variable by name.

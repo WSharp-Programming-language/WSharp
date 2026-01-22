@@ -142,8 +142,87 @@ impl DispatchTable {
 
     /// Checks if `sub` is a subtype of `super_`.
     fn is_subtype(sub: &Type, super_: &Type) -> bool {
-        // Basic subtype check - can be extended for prototype inheritance
-        sub == super_
+        match (sub, super_) {
+            // Equality is always a subtype
+            _ if sub == super_ => true,
+
+            // HTTP status subtyping
+            (Type::HttpStatus(sub_s), Type::HttpStatus(super_s)) => {
+                Self::http_status_is_subtype(&sub_s.kind, &super_s.kind)
+            }
+
+            // Never is subtype of everything (bottom type)
+            (Type::Never, _) => true,
+
+            // Prototype inheritance (placeholder for future extension)
+            (Type::Prototype(sub_p), Type::Prototype(super_p)) => {
+                // Check if sub's parent chain contains super
+                if let Some(parent) = &sub_p.parent {
+                    if let Type::Prototype(parent_p) = parent.as_ref() {
+                        parent_p == super_p || Self::is_subtype(parent.as_ref(), super_)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+
+            _ => false,
+        }
+    }
+
+    /// Checks if an HTTP status type is a subtype of another.
+    fn http_status_is_subtype(sub: &HttpStatusTypeKind, super_: &HttpStatusTypeKind) -> bool {
+        match (sub, super_) {
+            // Equal types are subtypes
+            _ if sub == super_ => true,
+
+            // Any type is a supertype of all HTTP status types
+            (_, HttpStatusTypeKind::Any) => true,
+
+            // Exact code is subtype of category if it belongs to that category
+            (HttpStatusTypeKind::Exact(code), HttpStatusTypeKind::Category(cat)) => {
+                cat.contains(*code)
+            }
+
+            // Exact code is subtype of range if it falls within the range
+            (HttpStatusTypeKind::Exact(code), HttpStatusTypeKind::Range { start, end }) => {
+                code >= start && code <= end
+            }
+
+            // Category is subtype of range if fully contained
+            (HttpStatusTypeKind::Category(cat), HttpStatusTypeKind::Range { start, end }) => {
+                let (cat_start, cat_end) = cat.range();
+                cat_start >= *start && cat_end <= *end
+            }
+
+            // Range is subtype of range if fully contained
+            (
+                HttpStatusTypeKind::Range { start: sub_start, end: sub_end },
+                HttpStatusTypeKind::Range { start: super_start, end: super_end },
+            ) => {
+                sub_start >= super_start && sub_end <= super_end
+            }
+
+            // Range is subtype of category if fully contained within category's range
+            (HttpStatusTypeKind::Range { start, end }, HttpStatusTypeKind::Category(cat)) => {
+                let (cat_start, cat_end) = cat.range();
+                *start >= cat_start && *end <= cat_end
+            }
+
+            // Subtype of union if subtype of any member
+            (sub_kind, HttpStatusTypeKind::Union(members)) => {
+                members.iter().any(|m| Self::http_status_is_subtype(sub_kind, m))
+            }
+
+            // Union is subtype if ALL members are subtypes
+            (HttpStatusTypeKind::Union(members), super_kind) => {
+                members.iter().all(|m| Self::http_status_is_subtype(m, super_kind))
+            }
+
+            _ => false,
+        }
     }
 
     /// Checks if a type matches an HTTP status pattern.

@@ -470,12 +470,24 @@ impl<'a, 'ctx> FunctionContext<'a, 'ctx> {
         callee: PointerValue<'ctx>,
         args: &[BasicMetadataValueEnum<'ctx>],
     ) -> CodegenResult<Option<BasicValueEnum<'ctx>>> {
-        // For now, assume all functions return i64 as a placeholder
-        // In a full implementation, we'd track function types properly
-        let fn_type = self.context().i64_type().fn_type(
-            &args.iter().map(|_| self.context().i64_type().into()).collect::<Vec<_>>(),
-            false,
-        );
+        // Derive parameter types from the actual argument values
+        let param_types: Vec<BasicMetadataTypeEnum> = args
+            .iter()
+            .map(|arg| match arg {
+                BasicMetadataValueEnum::IntValue(v) => v.get_type().into(),
+                BasicMetadataValueEnum::FloatValue(v) => v.get_type().into(),
+                BasicMetadataValueEnum::PointerValue(v) => v.get_type().into(),
+                BasicMetadataValueEnum::StructValue(v) => v.get_type().into(),
+                BasicMetadataValueEnum::ArrayValue(v) => v.get_type().into(),
+                BasicMetadataValueEnum::VectorValue(v) => v.get_type().into(),
+                BasicMetadataValueEnum::ScalableVectorValue(v) => v.get_type().into(),
+                BasicMetadataValueEnum::MetadataValue(_) => self.context().i64_type().into(),
+            })
+            .collect();
+
+        // For now, assume all functions return i64
+        // TODO: Track actual return types
+        let fn_type = self.context().i64_type().fn_type(&param_types, false);
 
         let call = self
             .builder()

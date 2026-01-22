@@ -235,6 +235,17 @@ impl StatusCategory {
             _ => None,
         }
     }
+
+    /// Returns the (start, end) range for this category (inclusive).
+    pub fn range(&self) -> (u16, u16) {
+        match self {
+            StatusCategory::Informational => (100, 199),
+            StatusCategory::Success => (200, 299),
+            StatusCategory::Redirection => (300, 399),
+            StatusCategory::ClientError => (400, 499),
+            StatusCategory::ServerError => (500, 599),
+        }
+    }
 }
 
 impl fmt::Display for Type {

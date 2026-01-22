@@ -10,8 +10,9 @@ use crate::{
 use std::collections::HashMap;
 use wsharp_lexer::Span;
 use wsharp_types::{
-    DispatchRole, FunctionType, HttpStatusType, HttpStatusTypeKind, InferenceContext, ParamType,
-    PrimitiveType, StatusCategory, Type, TypeError, TypeResult, TypeScheme,
+    calculate_specificity, DispatchEntry, DispatchRole, DispatchTable, FunctionId, FunctionType,
+    HttpStatusPattern, HttpStatusType, HttpStatusTypeKind, InferenceContext, ParamType,
+    PrimitiveType, StatusCategory, Type, TypeError, TypePattern, TypeResult, TypeScheme,
 };
 
 /// Type checker for HIR.
@@ -30,6 +31,24 @@ pub struct TypeChecker {
 
     /// Current function return type (for checking returns).
     current_return_type: Option<Type>,
+
+    /// Dispatch table for function overload resolution.
+    dispatch_table: DispatchTable,
+
+    /// Map from DefId to FunctionId (for dispatch).
+    def_to_function_id: HashMap<DefId, FunctionId>,
+
+    /// Map from FunctionId back to DefId.
+    function_id_to_def: HashMap<FunctionId, DefId>,
+
+    /// Map from DefId to function name.
+    def_to_name: HashMap<DefId, String>,
+
+    /// Map from function name to all overload DefIds.
+    name_to_defs: HashMap<String, Vec<DefId>>,
+
+    /// Next FunctionId to assign.
+    next_function_id: u32,
 }
 
 /// Errors during type checking.
@@ -74,6 +93,12 @@ impl TypeChecker {
             locals: HashMap::new(),
             errors: Vec::new(),
             current_return_type: None,
+            dispatch_table: DispatchTable::new(),
+            def_to_function_id: HashMap::new(),
+            function_id_to_def: HashMap::new(),
+            def_to_name: HashMap::new(),
+            name_to_defs: HashMap::new(),
+            next_function_id: 0,
         }
     }
 
@@ -108,7 +133,7 @@ impl TypeChecker {
                 } else {
                     p.ty.clone()
                 },
-                dispatch_role: DispatchRole::Static,
+                dispatch_role: self.dispatch_role_for_type(&p.ty),
             })
             .collect();
 
@@ -119,17 +144,78 @@ impl TypeChecker {
         };
 
         let func_type = Type::Function(FunctionType {
-            params: param_types,
+            params: param_types.clone(),
             return_type: Box::new(return_type),
             is_async: func.is_async,
         });
 
         self.functions.insert(func.id, func_type.clone());
 
+        // Register in dispatch table
+        let function_id = FunctionId(self.next_function_id);
+        self.next_function_id += 1;
+
+        self.def_to_function_id.insert(func.id, function_id);
+        self.function_id_to_def.insert(function_id, func.id);
+        self.def_to_name.insert(func.id, func.name.clone());
+
+        // Track all overloads for this function name
+        self.name_to_defs
+            .entry(func.name.clone())
+            .or_default()
+            .push(func.id);
+
+        // Build type patterns for dispatch
+        let patterns: Vec<TypePattern> = param_types
+            .iter()
+            .map(|p| self.type_to_pattern(&p.ty))
+            .collect();
+
+        let specificity = calculate_specificity(&patterns);
+
+        self.dispatch_table.register(
+            func.name.clone(),
+            DispatchEntry {
+                signature: patterns,
+                implementation: function_id,
+                specificity,
+            },
+        );
+
         // Also add to the inference context environment
         self.ctx
             .env_mut()
             .define(func.name.clone(), TypeScheme::mono(func_type));
+    }
+
+    /// Determine dispatch role based on type.
+    fn dispatch_role_for_type(&self, ty: &Type) -> DispatchRole {
+        match ty {
+            Type::HttpStatus(_) => DispatchRole::HttpStatusDispatch,
+            Type::Prototype(_) => DispatchRole::Dynamic,
+            Type::Function(_) => DispatchRole::FunctionDispatch,
+            _ => DispatchRole::Static,
+        }
+    }
+
+    /// Convert a type to a dispatch pattern.
+    fn type_to_pattern(&self, ty: &Type) -> TypePattern {
+        match ty {
+            Type::HttpStatus(status) => {
+                let http_pattern = match &status.kind {
+                    HttpStatusTypeKind::Exact(code) => HttpStatusPattern::Exact(*code),
+                    HttpStatusTypeKind::Category(cat) => HttpStatusPattern::Category(*cat),
+                    HttpStatusTypeKind::Range { start, end } => HttpStatusPattern::Range {
+                        start: *start,
+                        end: *end,
+                    },
+                    HttpStatusTypeKind::Any | HttpStatusTypeKind::Union(_) => HttpStatusPattern::Any,
+                };
+                TypePattern::HttpStatus(http_pattern)
+            }
+            Type::Unknown | Type::TypeVar(_) => TypePattern::Any,
+            _ => TypePattern::Exact(ty.clone()),
+        }
     }
 
     /// Type check a function.
@@ -233,9 +319,59 @@ impl TypeChecker {
             }
 
             HirExprKind::Call { callee, args } => {
-                let callee_ty = self.check_expr(callee);
                 let arg_types: Vec<Type> = args.iter_mut().map(|a| self.check_expr(a)).collect();
-                self.check_call(&callee_ty, &arg_types, expr.span)
+
+                // Try dispatch resolution if callee is a global function
+                if let HirExprKind::Global(id) = &callee.kind {
+                    if let Some(name) = self.def_to_name.get(id).cloned() {
+                        if let Some(overloads) = self.name_to_defs.get(&name) {
+                            if overloads.len() > 1 {
+                                // Multiple overloads - use dispatch resolution
+                                if let Ok(resolved_fn_id) =
+                                    self.dispatch_table.resolve(&name, &arg_types)
+                                {
+                                    if let Some(resolved_def_id) =
+                                        self.function_id_to_def.get(&resolved_fn_id).cloned()
+                                    {
+                                        // Update the callee to point to the resolved function
+                                        callee.kind = HirExprKind::Global(resolved_def_id);
+                                        let callee_ty = self
+                                            .functions
+                                            .get(&resolved_def_id)
+                                            .cloned()
+                                            .unwrap_or(Type::Unknown);
+                                        // Don't return early - let expr.ty be set at the end
+                                        self.check_call(&callee_ty, &arg_types, expr.span)
+                                    } else {
+                                        // Fall back to normal call checking
+                                        let callee_ty = self.check_expr(callee);
+                                        self.check_call(&callee_ty, &arg_types, expr.span)
+                                    }
+                                } else {
+                                    // Fall back to normal call checking
+                                    let callee_ty = self.check_expr(callee);
+                                    self.check_call(&callee_ty, &arg_types, expr.span)
+                                }
+                            } else {
+                                // Single overload - normal call
+                                let callee_ty = self.check_expr(callee);
+                                self.check_call(&callee_ty, &arg_types, expr.span)
+                            }
+                        } else {
+                            // No overloads found - normal call
+                            let callee_ty = self.check_expr(callee);
+                            self.check_call(&callee_ty, &arg_types, expr.span)
+                        }
+                    } else {
+                        // Name not found - normal call
+                        let callee_ty = self.check_expr(callee);
+                        self.check_call(&callee_ty, &arg_types, expr.span)
+                    }
+                } else {
+                    // Not a global function - normal call
+                    let callee_ty = self.check_expr(callee);
+                    self.check_call(&callee_ty, &arg_types, expr.span)
+                }
             }
 
             HirExprKind::MethodCall { receiver, method: _, args } => {

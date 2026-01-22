@@ -243,6 +243,26 @@ impl<'a> Lexer<'a> {
             return TokenKind::FloatLiteral(text.parse().unwrap_or(0.0));
         }
 
+        // Check for HTTP status category pattern (1xx, 2xx, 3xx, 4xx, 5xx)
+        if self.current == Some('x') && self.peek_next() == Some('x') {
+            let end_before_xx = self.pos as usize;
+            let text_before: String = self.source[start..end_before_xx]
+                .chars()
+                .filter(|c| *c != '_')
+                .collect();
+
+            // Only treat as category if it's a single digit 1-5
+            if text_before.len() == 1 && text_before.chars().next().unwrap().is_ascii_digit() {
+                let digit = text_before.chars().next().unwrap();
+                if ('1'..='5').contains(&digit) {
+                    self.advance(); // first x
+                    self.advance(); // second x
+                    let category = format!("{}xx", digit);
+                    return TokenKind::Ident(category);
+                }
+            }
+        }
+
         let end = self.pos as usize;
         let text: String = self.source[start..end].chars().filter(|c| *c != '_').collect();
         TokenKind::IntLiteral(text.parse().unwrap_or(0))

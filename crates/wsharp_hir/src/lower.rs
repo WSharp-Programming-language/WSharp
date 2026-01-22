@@ -12,13 +12,17 @@ use crate::{
     HirMatchArm, HirModule, HirParam, HirPattern, HirPrototype, HirStmt, HirTypeAlias, HirUnaryOp,
     LocalId, PrototypeInfo, ResolveError, Resolver, Symbol,
 };
+use std::collections::HashMap;
 use wsharp_ast::{
     BinaryOp, Block, Expr, ExprKind, FunctionDecl, HttpStatusCategory as AstHttpStatusCategory,
-    HttpStatusPattern as AstHttpStatusPattern, Item, Literal, Parameter,
+    HttpStatusPattern as AstHttpStatusPattern, HttpStatusTypeExpr, Item, Literal, Parameter,
     Pattern as AstPattern, PatternKind, PrototypeDecl, PrototypeMember, SourceFile, Stmt,
     StmtKind, TypeAliasDecl, TypeExpr, TypeExprKind, UnaryOp,
 };
-use wsharp_types::{PrimitiveType, Type};
+use wsharp_lexer::Span;
+use wsharp_types::{
+    HttpStatusType, HttpStatusTypeKind, PrimitiveType, StatusCategory, Type,
+};
 
 /// The lowering context.
 pub struct LoweringContext {
@@ -33,6 +37,9 @@ pub struct LoweringContext {
 
     /// Locals collected for the current function.
     current_locals: Vec<HirLocal>,
+
+    /// Map from function span to DefId (for supporting overloads).
+    function_spans: HashMap<Span, DefId>,
 }
 
 /// Errors during lowering.
@@ -55,6 +62,7 @@ impl LoweringContext {
             next_hir_id: 0,
             errors: Vec::new(),
             current_locals: Vec::new(),
+            function_spans: HashMap::new(),
         }
     }
 
@@ -136,9 +144,9 @@ impl LoweringContext {
                     is_async: *is_async,
                 })
             }
-            TypeExprKind::HttpStatus(_) => {
-                // HTTP status types - simplified for now
-                Type::Unknown
+            TypeExprKind::HttpStatus(http_status_expr) => {
+                let kind = self.lower_http_status_type_expr(http_status_expr);
+                Type::HttpStatus(HttpStatusType { kind })
             }
             TypeExprKind::Prototype { .. } => {
                 // Prototype types - would need full resolution
@@ -148,6 +156,35 @@ impl LoweringContext {
                 // Union/intersection types - simplified for now
                 Type::Unknown
             }
+        }
+    }
+
+    /// Convert AST HttpStatusTypeExpr to Type HttpStatusTypeKind.
+    fn lower_http_status_type_expr(&self, expr: &HttpStatusTypeExpr) -> HttpStatusTypeKind {
+        match expr {
+            HttpStatusTypeExpr::Exact(code) => HttpStatusTypeKind::Exact(*code),
+            HttpStatusTypeExpr::Category(cat) => {
+                let status_cat = match cat {
+                    AstHttpStatusCategory::Informational => StatusCategory::Informational,
+                    AstHttpStatusCategory::Success => StatusCategory::Success,
+                    AstHttpStatusCategory::Redirection => StatusCategory::Redirection,
+                    AstHttpStatusCategory::ClientError => StatusCategory::ClientError,
+                    AstHttpStatusCategory::ServerError => StatusCategory::ServerError,
+                };
+                HttpStatusTypeKind::Category(status_cat)
+            }
+            HttpStatusTypeExpr::Range { start, end } => HttpStatusTypeKind::Range {
+                start: *start,
+                end: *end,
+            },
+            HttpStatusTypeExpr::Union(types) => {
+                let kinds: Vec<HttpStatusTypeKind> = types
+                    .iter()
+                    .map(|t| self.lower_http_status_type_expr(t))
+                    .collect();
+                HttpStatusTypeKind::Union(kinds)
+            }
+            HttpStatusTypeExpr::Any => HttpStatusTypeKind::Any,
         }
     }
 
@@ -191,6 +228,8 @@ impl LoweringContext {
                             ty: Type::Unknown, // Will be set during type checking
                         },
                     );
+                    // Track function span to DefId for overload support
+                    self.function_spans.insert(func.span, def_id);
                 }
                 Item::Prototype(proto) => {
                     let def_id = self.resolver.fresh_def_id();
@@ -269,13 +308,12 @@ impl LoweringContext {
 
     /// Lower a function declaration.
     fn lower_function(&mut self, func: &FunctionDecl) -> HirFunction {
+        // Look up the DefId by span (assigned during collect_declarations).
+        // This supports function overloading - each function gets a unique DefId.
         let def_id = self
-            .resolver
-            .lookup_type(&func.name.name)
-            .and_then(|s| match s {
-                Symbol::Function { id, .. } => Some(*id),
-                _ => None,
-            })
+            .function_spans
+            .get(&func.span)
+            .cloned()
             .unwrap_or_else(|| self.resolver.fresh_def_id());
 
         self.resolver.enter_function_scope();

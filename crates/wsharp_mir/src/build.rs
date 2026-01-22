@@ -12,7 +12,7 @@ use wsharp_hir::{
     DefId, HirBinaryOp, HirBlock, HirBody, HirExpr, HirExprKind, HirFunction, HirItem, HirLiteral,
     HirModule, HirStmt, HirUnaryOp, LocalId,
 };
-use wsharp_types::{PrimitiveType, Type};
+use wsharp_types::{HttpStatusType, HttpStatusTypeKind, PrimitiveType, Type};
 
 /// Builder for converting HIR to MIR.
 pub struct MirBuilder {
@@ -455,8 +455,11 @@ impl<'a> FunctionBuilder<'a> {
             }
 
             HirExprKind::HttpStatus(code) => {
-                // HTTP status is represented as an integer constant
-                Operand::const_int(*code as i128, Type::Primitive(PrimitiveType::U16))
+                // HTTP status is represented as an integer constant with HttpStatus type
+                let http_type = Type::HttpStatus(HttpStatusType {
+                    kind: HttpStatusTypeKind::Exact(*code),
+                });
+                Operand::const_int(*code as i128, http_type)
             }
         }
     }
