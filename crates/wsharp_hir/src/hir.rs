@@ -187,6 +187,7 @@ pub enum HirExprKind {
         params: Vec<HirParam>,
         body: Box<HirExpr>,
         captures: Vec<LocalId>,
+        is_async: bool,
     },
 
     /// Await expression.

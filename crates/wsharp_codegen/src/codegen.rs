@@ -5,14 +5,14 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType};
-use inkwell::values::{AnyValue, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, PointerValue};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
+use inkwell::values::{AnyValue, BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue};
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 use std::collections::HashMap;
 use wsharp_mir::{
-    AggregateKind, BasicBlockId, BinOp, BodyId, BorrowKind, CastKind, Constant, Local, MirBody,
-    MirModule, Operand, Place, PlaceElem, Rvalue, StatementKind, SwitchTargets, TerminatorKind,
-    UnOp,
+    AggregateKind, BasicBlockId, BinOp, BodyId, CastKind, Constant,
+    CoroutineInfo, CoroutineStateLayout, Local, MirBody, MirModule, Operand, Place, PlaceElem,
+    Rvalue, StatementKind, TerminatorKind, UnOp,
 };
 use wsharp_types::{PrimitiveType, Type};
 
@@ -30,6 +30,12 @@ pub struct CodeGenerator<'ctx> {
     /// Mapping from MIR body IDs to LLVM functions.
     functions: HashMap<BodyId, FunctionValue<'ctx>>,
 
+    /// Mapping from MIR body IDs to their poll functions (for async).
+    poll_functions: HashMap<BodyId, FunctionValue<'ctx>>,
+
+    /// Mapping from MIR body IDs to their state struct types (for async).
+    state_types: HashMap<BodyId, inkwell::types::StructType<'ctx>>,
+
     /// Target triple.
     target_triple: String,
 }
@@ -45,6 +51,8 @@ impl<'ctx> CodeGenerator<'ctx> {
             module,
             builder,
             functions: HashMap::new(),
+            poll_functions: HashMap::new(),
+            state_types: HashMap::new(),
             target_triple: String::new(),
         }
     }
@@ -68,16 +76,42 @@ impl<'ctx> CodeGenerator<'ctx> {
 
     /// Generate code for an entire MIR module.
     pub fn codegen_module(&mut self, mir_module: &MirModule) -> CodegenResult<()> {
-        // First pass: declare all functions
+        // First pass: declare all functions and poll functions for async
         for (&body_id, body) in &mir_module.bodies {
-            let func = self.declare_function(body)?;
-            self.functions.insert(body_id, func);
+            if body.is_async && body.coroutine_info.is_some() {
+                // For async functions, generate state type and poll function
+                let coroutine_info = body.coroutine_info.as_ref().unwrap();
+                let state_type = self.llvm_coroutine_state_type(&coroutine_info.state_layout)?;
+                self.state_types.insert(body_id, state_type);
+
+                let poll_func = self.declare_poll_function(body, state_type)?;
+                self.poll_functions.insert(body_id, poll_func);
+
+                // Also declare a wrapper function with the original signature
+                let func = self.declare_function(body)?;
+                self.functions.insert(body_id, func);
+            } else {
+                let func = self.declare_function(body)?;
+                self.functions.insert(body_id, func);
+            }
         }
 
         // Second pass: generate function bodies
         for (&body_id, body) in &mir_module.bodies {
-            let func = self.functions[&body_id];
-            self.codegen_function(body, func)?;
+            if body.is_async && body.coroutine_info.is_some() {
+                // Generate poll function body
+                let poll_func = self.poll_functions[&body_id];
+                let state_type = self.state_types[&body_id];
+                self.codegen_poll_function(body, poll_func, state_type)?;
+
+                // Generate wrapper function that creates state and returns immediately
+                // (for now, the wrapper just allocates state and calls poll in a loop)
+                let func = self.functions[&body_id];
+                self.codegen_async_wrapper_function(body, func, poll_func, state_type)?;
+            } else {
+                let func = self.functions[&body_id];
+                self.codegen_function(body, func)?;
+            }
         }
 
         // Verify the module
@@ -127,8 +161,146 @@ impl<'ctx> CodeGenerator<'ctx> {
         body: &MirBody,
         func: FunctionValue<'ctx>,
     ) -> CodegenResult<()> {
-        let mut func_ctx = FunctionContext::new(self, body, func)?;
+        let mut func_ctx = FunctionContext::new(self, body, func, None)?;
         func_ctx.codegen_body()?;
+        Ok(())
+    }
+
+    /// Declare a poll function for an async body.
+    ///
+    /// Poll function signature: `fn poll(state: *mut StateStruct) -> PollResult<T>`
+    /// Where PollResult is `{ i8 discriminant, T value }`
+    fn declare_poll_function(
+        &self,
+        body: &MirBody,
+        state_type: inkwell::types::StructType<'ctx>,
+    ) -> CodegenResult<FunctionValue<'ctx>> {
+        // Get the result type (unwrap Future<T> to get T)
+        let result_ty = match &body.return_ty {
+            Type::Future(inner) => self.llvm_type(inner)?,
+            other => self.llvm_type(other)?,
+        };
+
+        // PollResult<T> = { i8 discriminant, T value }
+        let poll_result_ty = self.context.struct_type(
+            &[self.context.i8_type().into(), result_ty],
+            false,
+        );
+
+        // Parameter: pointer to state struct
+        let state_ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let param_types: Vec<BasicMetadataTypeEnum> = vec![state_ptr_ty.into()];
+
+        let fn_type = poll_result_ty.fn_type(&param_types, false);
+        let poll_fn_name = format!("__poll_{}", body.name);
+        let poll_func = self.module.add_function(&poll_fn_name, fn_type, None);
+
+        // Name the parameter
+        if let Some(param) = poll_func.get_first_param() {
+            param.set_name("state");
+        }
+
+        Ok(poll_func)
+    }
+
+    /// Generate code for a poll function body.
+    fn codegen_poll_function(
+        &mut self,
+        body: &MirBody,
+        poll_func: FunctionValue<'ctx>,
+        state_type: inkwell::types::StructType<'ctx>,
+    ) -> CodegenResult<()> {
+        let coroutine_info = body.coroutine_info.as_ref()
+            .ok_or_else(|| CodegenError::LlvmError("missing coroutine_info".into()))?;
+
+        let mut func_ctx = FunctionContext::new(self, body, poll_func, Some(CoroutineContext {
+            state_type,
+            coroutine_info: coroutine_info.clone(),
+        }))?;
+        func_ctx.codegen_poll_body()?;
+        Ok(())
+    }
+
+    /// Generate a wrapper function for an async function.
+    ///
+    /// The wrapper allocates state on the stack, initializes it, and polls until complete.
+    fn codegen_async_wrapper_function(
+        &self,
+        body: &MirBody,
+        wrapper_func: FunctionValue<'ctx>,
+        poll_func: FunctionValue<'ctx>,
+        state_type: inkwell::types::StructType<'ctx>,
+    ) -> CodegenResult<()> {
+        // Create entry block
+        let entry_bb = self.context.append_basic_block(wrapper_func, "entry");
+        let poll_loop_bb = self.context.append_basic_block(wrapper_func, "poll_loop");
+        let done_bb = self.context.append_basic_block(wrapper_func, "done");
+
+        self.builder.position_at_end(entry_bb);
+
+        // Allocate state struct on stack
+        let state_ptr = self.builder.build_alloca(state_type, "state")
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        // Initialize __state field to 0
+        let state_field_ptr = self.builder.build_struct_gep(state_type, state_ptr, 0, "__state")
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+        let zero = self.context.i32_type().const_int(0, false);
+        self.builder.build_store(state_field_ptr, zero)
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        // Store any function arguments into the state struct
+        // Arguments are stored after __state and __result fields
+        for (i, param) in wrapper_func.get_param_iter().enumerate() {
+            // Field index: 2 + i (skip __state and __result)
+            let field_idx = (2 + i) as u32;
+            if field_idx < state_type.count_fields() {
+                let arg_field_ptr = self.builder.build_struct_gep(state_type, state_ptr, field_idx, &format!("arg_{}", i))
+                    .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+                self.builder.build_store(arg_field_ptr, param)
+                    .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+            }
+        }
+
+        // Jump to poll loop
+        self.builder.build_unconditional_branch(poll_loop_bb)
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        // Poll loop: call poll function until ready
+        self.builder.position_at_end(poll_loop_bb);
+        let poll_result = self.builder.build_call(poll_func, &[state_ptr.into()], "poll_result")
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        let poll_result_val = poll_result.as_any_value_enum();
+        let poll_result_struct = if poll_result_val.is_struct_value() {
+            poll_result_val.into_struct_value()
+        } else {
+            return Err(CodegenError::LlvmError("poll returned non-struct".into()));
+        };
+
+        // Extract discriminant (field 0)
+        let discr = self.builder.build_extract_value(poll_result_struct, 0, "discr")
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        // Check if ready (discriminant == 1)
+        let is_ready = self.builder.build_int_compare(
+            IntPredicate::EQ,
+            discr.into_int_value(),
+            self.context.i8_type().const_int(1, false),
+            "is_ready",
+        ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        self.builder.build_conditional_branch(is_ready, done_bb, poll_loop_bb)
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        // Done block: extract result and return
+        self.builder.position_at_end(done_bb);
+        let result_value = self.builder.build_extract_value(poll_result_struct, 1, "result")
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        self.builder.build_return(Some(&result_value))
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
         Ok(())
     }
 
@@ -236,6 +408,361 @@ impl<'ctx> CodeGenerator<'ctx> {
                 | PrimitiveType::I128
         )
     }
+
+    // =========================================================================
+    // Coroutine Codegen Support
+    // =========================================================================
+
+    /// Generate the LLVM struct type for a coroutine state.
+    ///
+    /// The state struct contains:
+    /// - __state: u32 (current state index)
+    /// - __result: T (the result type)
+    /// - Saved locals that are live across yield points
+    fn llvm_coroutine_state_type(
+        &self,
+        layout: &CoroutineStateLayout,
+    ) -> CodegenResult<inkwell::types::StructType<'ctx>> {
+        let field_types: Vec<BasicTypeEnum> = layout
+            .fields
+            .iter()
+            .map(|(_, ty)| self.llvm_type(ty))
+            .collect::<CodegenResult<Vec<_>>>()?;
+
+        Ok(self.context.struct_type(&field_types, false))
+    }
+
+    /// Generate the PollResult<T> type.
+    ///
+    /// PollResult is represented as: { i8 discriminant, T value }
+    /// - discriminant 0 = Pending
+    /// - discriminant 1 = Ready
+    fn llvm_poll_result_type(&self, result_ty: &Type) -> CodegenResult<inkwell::types::StructType<'ctx>> {
+        let discr_ty = self.context.i8_type();
+        let value_ty = self.llvm_type(result_ty)?;
+        Ok(self.context.struct_type(&[discr_ty.into(), value_ty], false))
+    }
+
+    /// Create a Pending poll result value.
+    fn create_pending_result(
+        &self,
+        poll_result_ty: inkwell::types::StructType<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        let discr = self.context.i8_type().const_int(0, false);
+        // Create undef for the value field since it's not used for Pending
+        let value = poll_result_ty.get_field_type_at_index(1).unwrap();
+        let undef_value = match value {
+            BasicTypeEnum::IntType(t) => t.const_zero().into(),
+            BasicTypeEnum::FloatType(t) => t.const_zero().into(),
+            BasicTypeEnum::PointerType(t) => t.const_null().into(),
+            BasicTypeEnum::StructType(t) => t.const_zero().into(),
+            BasicTypeEnum::ArrayType(t) => t.const_zero().into(),
+            BasicTypeEnum::VectorType(t) => t.const_zero().into(),
+            BasicTypeEnum::ScalableVectorType(t) => t.const_zero().into(),
+        };
+        poll_result_ty.const_named_struct(&[discr.into(), undef_value]).into()
+    }
+
+    /// Create a Ready poll result value.
+    fn create_ready_result(
+        &self,
+        poll_result_ty: inkwell::types::StructType<'ctx>,
+        value: BasicValueEnum<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        let discr = self.context.i8_type().const_int(1, false);
+        poll_result_ty.const_named_struct(&[discr.into(), value]).into()
+    }
+
+    // =========================================================================
+    // Executor Runtime Integration
+    // =========================================================================
+
+    /// Declare the executor runtime functions.
+    ///
+    /// These are extern "C" functions from wsharp_runtime that will be linked
+    /// at runtime for async/await support.
+    pub fn declare_executor_runtime(&self) {
+        // wsharp_executor_new() -> *mut Executor
+        let executor_ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let new_fn_ty = executor_ptr_ty.fn_type(&[], false);
+        self.module.add_function("wsharp_executor_new", new_fn_ty, None);
+
+        // wsharp_executor_destroy(*mut Executor)
+        let destroy_fn_ty = self.context.void_type().fn_type(
+            &[executor_ptr_ty.into()],
+            false,
+        );
+        self.module.add_function("wsharp_executor_destroy", destroy_fn_ty, None);
+
+        // wsharp_executor_run(*mut Executor)
+        let run_fn_ty = self.context.void_type().fn_type(
+            &[executor_ptr_ty.into()],
+            false,
+        );
+        self.module.add_function("wsharp_executor_run", run_fn_ty, None);
+
+        // wsharp_block_on_i64(*mut Executor, *mut state, poll_fn) -> i64
+        let poll_fn_ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let state_ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let block_on_fn_ty = self.context.i64_type().fn_type(
+            &[executor_ptr_ty.into(), state_ptr_ty.into(), poll_fn_ptr_ty.into()],
+            false,
+        );
+        self.module.add_function("wsharp_block_on_i64", block_on_fn_ty, None);
+    }
+
+    /// Generate a synchronous wrapper for an async function.
+    ///
+    /// This creates a function that:
+    /// 1. Allocates the coroutine state struct
+    /// 2. Initializes the state
+    /// 3. Creates an executor
+    /// 4. Calls block_on to run the coroutine to completion
+    /// 5. Returns the result
+    pub fn generate_async_wrapper(
+        &self,
+        async_fn_name: &str,
+        wrapper_name: &str,
+        state_layout: &CoroutineStateLayout,
+        return_ty: &Type,
+    ) -> CodegenResult<FunctionValue<'ctx>> {
+        // Create the wrapper function type
+        let llvm_return_ty = self.llvm_type(return_ty)?;
+        let wrapper_fn_ty = match llvm_return_ty {
+            BasicTypeEnum::IntType(t) => t.fn_type(&[], false),
+            BasicTypeEnum::FloatType(t) => t.fn_type(&[], false),
+            BasicTypeEnum::PointerType(t) => t.fn_type(&[], false),
+            BasicTypeEnum::StructType(t) => t.fn_type(&[], false),
+            _ => return Err(CodegenError::UnsupportedType("unsupported async return type".into())),
+        };
+
+        let wrapper_fn = self.module.add_function(wrapper_name, wrapper_fn_ty, None);
+
+        // Create entry block
+        let entry_bb = self.context.append_basic_block(wrapper_fn, "entry");
+        self.builder.position_at_end(entry_bb);
+
+        // Allocate the coroutine state struct
+        let state_ty = self.llvm_coroutine_state_type(state_layout)?;
+        let state_ptr = self.builder.build_alloca(state_ty, "state")
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        // Initialize the state to 0 (initial state)
+        let state_field_ptr = self.builder.build_struct_gep(state_ty, state_ptr, 0, "state_field")
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+        let zero_state = self.context.i32_type().const_int(0, false);
+        self.builder.build_store(state_field_ptr, zero_state)
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        // Get the poll function
+        let poll_fn_name = format!("__poll_{}", async_fn_name);
+        let poll_fn = self.module.get_function(&poll_fn_name);
+
+        // Get executor runtime functions
+        let executor_new = self.module.get_function("wsharp_executor_new");
+        let executor_destroy = self.module.get_function("wsharp_executor_destroy");
+        let block_on = self.module.get_function("wsharp_block_on_i64");
+
+        // Check if we have the runtime functions
+        if executor_new.is_none() || executor_destroy.is_none() || block_on.is_none() {
+            // If executor runtime is not available, fall back to direct polling
+            return self.generate_direct_poll_wrapper(
+                wrapper_fn,
+                state_ptr,
+                state_ty,
+                poll_fn,
+                return_ty,
+            );
+        }
+
+        let executor_new = executor_new.unwrap();
+        let executor_destroy = executor_destroy.unwrap();
+        let block_on = block_on.unwrap();
+
+        // Create executor
+        let executor_call = self.builder.build_call(executor_new, &[], "executor")
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+        let executor_val = executor_call.as_any_value_enum();
+        let executor = if executor_val.is_pointer_value() {
+            executor_val.into_pointer_value().into()
+        } else {
+            return Err(CodegenError::LlvmError("executor_new returned non-pointer".into()));
+        };
+
+        // Cast state pointer to void*
+        let void_state_ptr = self.builder.build_pointer_cast(
+            state_ptr,
+            self.context.ptr_type(AddressSpace::default()),
+            "void_state",
+        ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        // Get poll function as pointer (or create a stub if not available)
+        let poll_fn_ptr = match poll_fn {
+            Some(f) => f.as_global_value().as_pointer_value(),
+            None => {
+                // Create a stub poll function that returns immediately
+                self.context.ptr_type(AddressSpace::default()).const_null()
+            }
+        };
+
+        // Call block_on
+        let block_on_call = self.builder.build_call(
+            block_on,
+            &[
+                executor,
+                void_state_ptr.into(),
+                poll_fn_ptr.into(),
+            ],
+            "result",
+        )
+        .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+        let block_on_val = block_on_call.as_any_value_enum();
+        let result = if block_on_val.is_int_value() {
+            block_on_val.into_int_value().into()
+        } else {
+            return Err(CodegenError::LlvmError("block_on returned non-int".into()));
+        };
+
+        // Destroy executor
+        self.builder.build_call(executor_destroy, &[executor.into()], "")
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        // Return result (may need type conversion)
+        let final_result = self.convert_result_type(result, return_ty)?;
+        self.builder.build_return(Some(&final_result))
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        Ok(wrapper_fn)
+    }
+
+    /// Generate a direct poll wrapper (fallback when executor runtime is not available).
+    fn generate_direct_poll_wrapper(
+        &self,
+        wrapper_fn: FunctionValue<'ctx>,
+        state_ptr: PointerValue<'ctx>,
+        state_ty: inkwell::types::StructType<'ctx>,
+        poll_fn: Option<FunctionValue<'ctx>>,
+        return_ty: &Type,
+    ) -> CodegenResult<FunctionValue<'ctx>> {
+        // If no poll function exists, return a default value
+        let poll_fn = match poll_fn {
+            Some(f) => f,
+            None => {
+                let default_value = self.create_default_value(return_ty)?;
+                self.builder.build_return(Some(&default_value))
+                    .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+                return Ok(wrapper_fn);
+            }
+        };
+
+        // Cast state pointer to void*
+        let void_state_ptr = self.builder.build_pointer_cast(
+            state_ptr,
+            self.context.ptr_type(AddressSpace::default()),
+            "void_state",
+        ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        // Create a simple polling loop
+        let loop_bb = self.context.append_basic_block(wrapper_fn, "poll_loop");
+        let done_bb = self.context.append_basic_block(wrapper_fn, "done");
+
+        self.builder.build_unconditional_branch(loop_bb)
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        // Poll loop
+        self.builder.position_at_end(loop_bb);
+        let null_ctx = self.context.ptr_type(AddressSpace::default()).const_null();
+        let poll_call = self.builder.build_call(
+            poll_fn,
+            &[void_state_ptr.into(), null_ctx.into()],
+            "poll_result",
+        )
+        .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+        let poll_val = poll_call.as_any_value_enum();
+        let poll_result_struct = if poll_val.is_struct_value() {
+            poll_val.into_struct_value()
+        } else {
+            return Err(CodegenError::LlvmError("poll function returned non-struct".into()));
+        };
+
+        // Check discriminant (field 0 of the PollResult struct)
+        let discr = self.builder.build_extract_value(poll_result_struct, 0, "discr")
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        let is_ready = self.builder.build_int_compare(
+            IntPredicate::EQ,
+            discr.into_int_value(),
+            self.context.i8_type().const_int(1, false),
+            "is_ready",
+        ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        self.builder.build_conditional_branch(is_ready, done_bb, loop_bb)
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        // Done block - extract and return the result
+        self.builder.position_at_end(done_bb);
+        let result_value = self.builder.build_extract_value(poll_result_struct, 1, "result")
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        self.builder.build_return(Some(&result_value))
+            .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        Ok(wrapper_fn)
+    }
+
+    /// Convert result from block_on (i64) to the expected return type.
+    fn convert_result_type(
+        &self,
+        value: BasicValueEnum<'ctx>,
+        target_ty: &Type,
+    ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        let llvm_target = self.llvm_type(target_ty)?;
+
+        // If types match, return as-is
+        if value.get_type() == llvm_target {
+            return Ok(value);
+        }
+
+        // Handle integer type conversions
+        if let BasicTypeEnum::IntType(target_int) = llvm_target {
+            if let BasicValueEnum::IntValue(src_int) = value {
+                let src_bits = src_int.get_type().get_bit_width();
+                let target_bits = target_int.get_bit_width();
+
+                if src_bits > target_bits {
+                    return Ok(self.builder.build_int_truncate(src_int, target_int, "trunc")
+                        .map_err(|e| CodegenError::LlvmError(e.to_string()))?.into());
+                } else if src_bits < target_bits {
+                    return Ok(self.builder.build_int_s_extend(src_int, target_int, "sext")
+                        .map_err(|e| CodegenError::LlvmError(e.to_string()))?.into());
+                }
+            }
+        }
+
+        Ok(value)
+    }
+
+    /// Create a default value for a type (used when async function has no poll function).
+    fn create_default_value(&self, ty: &Type) -> CodegenResult<BasicValueEnum<'ctx>> {
+        let llvm_ty = self.llvm_type(ty)?;
+        Ok(match llvm_ty {
+            BasicTypeEnum::IntType(t) => t.const_zero().into(),
+            BasicTypeEnum::FloatType(t) => t.const_zero().into(),
+            BasicTypeEnum::PointerType(t) => t.const_null().into(),
+            BasicTypeEnum::StructType(t) => t.const_zero().into(),
+            BasicTypeEnum::ArrayType(t) => t.const_zero().into(),
+            BasicTypeEnum::VectorType(t) => t.const_zero().into(),
+            BasicTypeEnum::ScalableVectorType(t) => t.const_zero().into(),
+        })
+    }
+}
+
+/// Coroutine-specific context for poll function generation.
+struct CoroutineContext<'ctx> {
+    /// The state struct type.
+    state_type: inkwell::types::StructType<'ctx>,
+    /// Coroutine metadata from MIR.
+    coroutine_info: CoroutineInfo,
 }
 
 /// Context for generating a single function.
@@ -254,6 +781,18 @@ struct FunctionContext<'a, 'ctx> {
 
     /// Mapping from MIR basic blocks to LLVM basic blocks.
     blocks: HashMap<BasicBlockId, BasicBlock<'ctx>>,
+
+    /// Coroutine context (for poll functions).
+    coroutine_ctx: Option<CoroutineContext<'ctx>>,
+
+    /// State pointer local (for poll functions).
+    state_ptr: Option<PointerValue<'ctx>>,
+
+    /// Pending block for coroutines.
+    pending_block: Option<BasicBlock<'ctx>>,
+
+    /// Ready block for coroutines.
+    ready_block: Option<BasicBlock<'ctx>>,
 }
 
 impl<'a, 'ctx> FunctionContext<'a, 'ctx> {
@@ -261,6 +800,7 @@ impl<'a, 'ctx> FunctionContext<'a, 'ctx> {
         codegen: &'a CodeGenerator<'ctx>,
         body: &'a MirBody,
         func: FunctionValue<'ctx>,
+        coroutine_ctx: Option<CoroutineContext<'ctx>>,
     ) -> CodegenResult<Self> {
         Ok(Self {
             codegen,
@@ -268,6 +808,10 @@ impl<'a, 'ctx> FunctionContext<'a, 'ctx> {
             func,
             locals: HashMap::new(),
             blocks: HashMap::new(),
+            coroutine_ctx,
+            state_ptr: None,
+            pending_block: None,
+            ready_block: None,
         })
     }
 
@@ -329,6 +873,326 @@ impl<'a, 'ctx> FunctionContext<'a, 'ctx> {
             }
         }
 
+        Ok(())
+    }
+
+    /// Generate code for a poll function body (async/coroutine).
+    fn codegen_poll_body(&mut self) -> CodegenResult<()> {
+        // Extract state type and coroutine info (we need to copy because we'll borrow self mutably)
+        let (state_type, coroutine_info) = match &self.coroutine_ctx {
+            Some(ctx) => (ctx.state_type, ctx.coroutine_info.clone()),
+            None => return Err(CodegenError::LlvmError("missing coroutine context".into())),
+        };
+
+        // Create special blocks for the poll function
+        let entry = self.context().append_basic_block(self.func, "entry");
+        let dispatch = self.context().append_basic_block(self.func, "dispatch");
+        let pending = self.context().append_basic_block(self.func, "pending");
+        let ready = self.context().append_basic_block(self.func, "ready");
+
+        self.pending_block = Some(pending);
+        self.ready_block = Some(ready);
+
+        self.builder().position_at_end(entry);
+
+        // Get the state pointer from the first parameter
+        let state_ptr = self.func.get_first_param()
+            .ok_or_else(|| CodegenError::LlvmError("poll function missing state param".into()))?
+            .into_pointer_value();
+        self.state_ptr = Some(state_ptr);
+
+        // Allocate all locals on the stack
+        for (i, decl) in self.body.locals.iter().enumerate() {
+            let local = Local(i as u32);
+            // For the state pointer local, use the function parameter instead of allocating
+            if decl.name.as_deref() == Some("__state_ptr") {
+                // Map this local to the state pointer parameter
+                self.locals.insert(local, state_ptr);
+                continue;
+            }
+            let ty = self.codegen.llvm_type(&decl.ty)?;
+            let default_name = format!("_{}", i);
+            let name = decl.name.as_deref().unwrap_or(&default_name);
+            let alloca = self.builder().build_alloca(ty, name)?;
+            self.locals.insert(local, alloca);
+        }
+
+        // Create LLVM basic blocks for each MIR block
+        for &block_id in self.body.basic_blocks.keys() {
+            let name = format!("bb{}", block_id.0);
+            let bb = self.context().append_basic_block(self.func, &name);
+            self.blocks.insert(block_id, bb);
+        }
+
+        // Jump from entry to dispatch
+        self.builder().build_unconditional_branch(dispatch)?;
+
+        // Setup dispatch block - switch on __state field
+        self.builder().position_at_end(dispatch);
+
+        // Load __state from state struct (field 0)
+        let state_field_ptr = self.builder().build_struct_gep(
+            state_type,
+            state_ptr,
+            0,
+            "__state_ptr",
+        ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+        let state_val = self.builder().build_load(
+            self.context().i32_type(),
+            state_field_ptr,
+            "__state",
+        ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        // Build switch on state value
+        // State 0 -> entry block of original function
+        // State N -> resume block for yield point N
+        let entry_block = self.blocks.get(&BasicBlockId::ENTRY)
+            .copied()
+            .unwrap_or(pending);
+
+        let mut cases: Vec<(IntValue<'ctx>, BasicBlock<'ctx>)> = vec![
+            (self.context().i32_type().const_int(0, false), entry_block),
+        ];
+
+        for yp in &coroutine_info.yield_points {
+            if let Some(&resume_bb) = self.blocks.get(&yp.resume_block) {
+                cases.push((
+                    self.context().i32_type().const_int(yp.state_index as u64, false),
+                    resume_bb,
+                ));
+            }
+        }
+
+        // Default case goes to ready (completed state)
+        self.builder().build_switch(
+            state_val.into_int_value(),
+            ready,
+            &cases,
+        ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        // Generate code for each basic block
+        for (&block_id, block) in &self.body.basic_blocks {
+            let llvm_block = self.blocks[&block_id];
+            self.builder().position_at_end(llvm_block);
+
+            // For resume blocks, first restore locals from state
+            for yp in &coroutine_info.yield_points {
+                if yp.resume_block == block_id {
+                    self.restore_locals_from_state(state_type, &coroutine_info, &yp.live_locals)?;
+                    break;
+                }
+            }
+
+            // Generate statements
+            for stmt in &block.statements {
+                self.codegen_statement(stmt)?;
+            }
+
+            // Generate terminator
+            if let Some(ref term) = block.terminator {
+                self.codegen_poll_terminator(&term.kind, state_type, &coroutine_info)?;
+            }
+        }
+
+        // Setup pending block - return Pending
+        self.builder().position_at_end(pending);
+        let result_ty = match &self.body.return_ty {
+            Type::Future(inner) => self.codegen.llvm_type(inner)?,
+            other => self.codegen.llvm_type(other)?,
+        };
+        let poll_result_ty = self.context().struct_type(
+            &[self.context().i8_type().into(), result_ty],
+            false,
+        );
+        let pending_result = poll_result_ty.const_named_struct(&[
+            self.context().i8_type().const_int(0, false).into(), // Pending = 0
+            self.codegen.create_default_value(&self.body.return_ty)?,
+        ]);
+        self.builder().build_return(Some(&pending_result))?;
+
+        // Setup ready block - return Ready with result
+        self.builder().position_at_end(ready);
+
+        // Load result from state struct (field 1)
+        let result_field_ptr = self.builder().build_struct_gep(
+            state_type,
+            state_ptr,
+            1,
+            "__result_ptr",
+        ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+        let result_val = self.builder().build_load(
+            result_ty,
+            result_field_ptr,
+            "__result",
+        ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        let ready_result = self.builder().build_insert_value(
+            poll_result_ty.const_zero(),
+            self.context().i8_type().const_int(1, false), // Ready = 1
+            0,
+            "ready_discr",
+        ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        let ready_result = self.builder().build_insert_value(
+            ready_result.into_struct_value(),
+            result_val,
+            1,
+            "ready_result",
+        ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+        self.builder().build_return(Some(&ready_result.into_struct_value()))?;
+
+        Ok(())
+    }
+
+    /// Restore locals from state struct after resuming.
+    fn restore_locals_from_state(
+        &self,
+        state_type: inkwell::types::StructType<'ctx>,
+        coroutine_info: &CoroutineInfo,
+        live_locals: &[Local],
+    ) -> CodegenResult<()> {
+        let state_ptr = self.state_ptr
+            .ok_or_else(|| CodegenError::LlvmError("missing state pointer".into()))?;
+
+        for &local in live_locals {
+            if let Some(&field_idx) = coroutine_info.local_to_state_field.get(&local) {
+                if let Some(&local_ptr) = self.locals.get(&local) {
+                    let field_ty = self.codegen.llvm_type(&self.body.locals[local.0 as usize].ty)?;
+                    let field_ptr = self.builder().build_struct_gep(
+                        state_type,
+                        state_ptr,
+                        field_idx as u32,
+                        &format!("state_field_{}", field_idx),
+                    ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+                    let val = self.builder().build_load(field_ty, field_ptr, "restored")
+                        .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+                    self.builder().build_store(local_ptr, val)
+                        .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Save locals to state struct before yielding.
+    fn save_locals_to_state(
+        &self,
+        state_type: inkwell::types::StructType<'ctx>,
+        coroutine_info: &CoroutineInfo,
+        live_locals: &[Local],
+    ) -> CodegenResult<()> {
+        let state_ptr = self.state_ptr
+            .ok_or_else(|| CodegenError::LlvmError("missing state pointer".into()))?;
+
+        for &local in live_locals {
+            if let Some(&field_idx) = coroutine_info.local_to_state_field.get(&local) {
+                if let Some(&local_ptr) = self.locals.get(&local) {
+                    let field_ty = self.codegen.llvm_type(&self.body.locals[local.0 as usize].ty)?;
+
+                    let val = self.builder().build_load(field_ty, local_ptr, "to_save")
+                        .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+                    let field_ptr = self.builder().build_struct_gep(
+                        state_type,
+                        state_ptr,
+                        field_idx as u32,
+                        &format!("state_field_{}", field_idx),
+                    ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+                    self.builder().build_store(field_ptr, val)
+                        .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Generate code for a terminator in a poll function.
+    fn codegen_poll_terminator(
+        &mut self,
+        kind: &TerminatorKind,
+        state_type: inkwell::types::StructType<'ctx>,
+        coroutine_info: &CoroutineInfo,
+    ) -> CodegenResult<()> {
+        match kind {
+            TerminatorKind::Yield { value: _, resume } => {
+                // Find the yield point info for this yield
+                let yp_info = coroutine_info.yield_points
+                    .iter()
+                    .find(|yp| yp.resume_block == *resume);
+
+                if let Some(yp) = yp_info {
+                    // Save live locals to state
+                    self.save_locals_to_state(state_type, coroutine_info, &yp.live_locals)?;
+
+                    // Update __state to the next state
+                    let state_ptr = self.state_ptr
+                        .ok_or_else(|| CodegenError::LlvmError("missing state pointer".into()))?;
+                    let state_field_ptr = self.builder().build_struct_gep(
+                        state_type,
+                        state_ptr,
+                        0,
+                        "__state_ptr",
+                    ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+                    let next_state = self.context().i32_type().const_int(yp.state_index as u64, false);
+                    self.builder().build_store(state_field_ptr, next_state)
+                        .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+                }
+
+                // Branch to pending block
+                let pending = self.pending_block
+                    .ok_or_else(|| CodegenError::LlvmError("missing pending block".into()))?;
+                self.builder().build_unconditional_branch(pending)?;
+            }
+
+            TerminatorKind::Return => {
+                // Store result in state struct and branch to ready
+                let state_ptr = self.state_ptr
+                    .ok_or_else(|| CodegenError::LlvmError("missing state pointer".into()))?;
+
+                // Load the return value from _0
+                let return_local = Local::RETURN_PLACE;
+                if let Some(&return_ptr) = self.locals.get(&return_local) {
+                    let result_ty = match &self.body.return_ty {
+                        Type::Future(inner) => self.codegen.llvm_type(inner)?,
+                        other => self.codegen.llvm_type(other)?,
+                    };
+                    let return_val = self.builder().build_load(result_ty, return_ptr, "return_val")
+                        .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+                    // Store in __result field (field 1)
+                    let result_field_ptr = self.builder().build_struct_gep(
+                        state_type,
+                        state_ptr,
+                        1,
+                        "__result_ptr",
+                    ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+                    self.builder().build_store(result_field_ptr, return_val)
+                        .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+                }
+
+                // Set __state to completed (u32::MAX)
+                let state_field_ptr = self.builder().build_struct_gep(
+                    state_type,
+                    state_ptr,
+                    0,
+                    "__state_ptr",
+                ).map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+                let done_state = self.context().i32_type().const_int(u32::MAX as u64, false);
+                self.builder().build_store(state_field_ptr, done_state)
+                    .map_err(|e| CodegenError::LlvmError(e.to_string()))?;
+
+                // Branch to ready block
+                let ready = self.ready_block
+                    .ok_or_else(|| CodegenError::LlvmError("missing ready block".into()))?;
+                self.builder().build_unconditional_branch(ready)?;
+            }
+
+            // For other terminators, use the normal codegen
+            _ => self.codegen_terminator(kind)?,
+        }
         Ok(())
     }
 
@@ -455,8 +1319,19 @@ impl<'a, 'ctx> FunctionContext<'a, 'ctx> {
                 self.builder().build_unreachable()?;
             }
 
-            TerminatorKind::Yield { value, resume } => {
-                // Yield is a no-op for now (async state machine would handle this)
+            TerminatorKind::Yield { value: _, resume } => {
+                // After coroutine transformation, Yield terminators are converted to:
+                // 1. Save live locals to state struct
+                // 2. Update __state field
+                // 3. Branch to pending block (return Pending)
+                //
+                // If we reach here with an untransformed Yield, it means the async
+                // function had no yield points or transformation wasn't applied.
+                // In that case, just branch to resume block.
+                //
+                // For transformed coroutines, the MIR transformation has already
+                // replaced Yield with Goto to pending block, so this code path
+                // should not be reached for properly transformed async functions.
                 let bb = self.blocks[resume];
                 self.builder().build_unconditional_branch(bb)?;
             }
@@ -1099,13 +1974,30 @@ impl<'a, 'ctx> FunctionContext<'a, 'ctx> {
 
     /// Convert a MIR place to an LLVM pointer.
     fn place_to_ptr(&self, place: &Place) -> CodegenResult<PointerValue<'ctx>> {
-        let mut ptr = self.locals[&place.local];
+        let mut ptr = *self.locals.get(&place.local).ok_or_else(|| {
+            CodegenError::LlvmError(format!(
+                "missing local {:?} in function '{}', available locals: {:?}",
+                place.local,
+                self.body.name,
+                self.locals.keys().collect::<Vec<_>>()
+            ))
+        })?;
 
         for elem in &place.projection {
             match elem {
                 PlaceElem::Deref => {
                     let local = place.local;
                     let decl = &self.body.locals[local.0 as usize];
+
+                    // Check if this is the __state_ptr local in a coroutine
+                    // In that case, the local is already the state pointer (function param),
+                    // so we don't need to load/deref - just continue with the current ptr
+                    if decl.name.as_deref() == Some("__state_ptr") && self.coroutine_ctx.is_some() {
+                        // The state pointer is already loaded as the function parameter
+                        // No need to deref, ptr is already pointing to the state struct
+                        continue;
+                    }
+
                     let inner_ty = if let Type::Ref { inner, .. } = &decl.ty {
                         self.codegen.llvm_type(inner)?
                     } else {
@@ -1119,10 +2011,22 @@ impl<'a, 'ctx> FunctionContext<'a, 'ctx> {
                     ptr = loaded.into_pointer_value();
                 }
                 PlaceElem::Field(idx, ty) => {
-                    let field_ty = self.codegen.llvm_type(ty)?;
+                    let _field_ty = self.codegen.llvm_type(ty)?;
                     let local = place.local;
                     let decl = &self.body.locals[local.0 as usize];
-                    let struct_ty = self.codegen.llvm_type(&decl.ty)?;
+
+                    // Check if this is accessing fields through the __state_ptr
+                    // In that case, use the coroutine's state type instead of the local's type
+                    let struct_ty = if decl.name.as_deref() == Some("__state_ptr") {
+                        if let Some(ref ctx) = self.coroutine_ctx {
+                            ctx.state_type.into()
+                        } else {
+                            self.codegen.llvm_type(&decl.ty)?
+                        }
+                    } else {
+                        self.codegen.llvm_type(&decl.ty)?
+                    };
+
                     ptr = self.builder().build_struct_gep(
                         struct_ty.into_struct_type(),
                         ptr,

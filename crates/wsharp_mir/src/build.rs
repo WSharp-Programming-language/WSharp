@@ -66,6 +66,9 @@ impl MirBuilder {
             }
         }
 
+        // Transform async functions to coroutine state machines
+        crate::coroutine::transform_async_functions(&mut self.module);
+
         self.module
     }
 
@@ -401,6 +404,7 @@ impl<'a> FunctionBuilder<'a> {
                 params,
                 body,
                 captures,
+                is_async,
             } => {
                 // For now, lambdas are lowered as closures
                 // A full implementation would create a separate MIR body
@@ -416,6 +420,8 @@ impl<'a> FunctionBuilder<'a> {
 
                 let temp = self.new_temp(expr.ty.clone());
                 // Placeholder body ID - proper implementation would create the lambda body
+                // Note: is_async is tracked in the function type, not in the closure aggregate
+                let _ = is_async; // Async info is captured in expr.ty (FunctionType with is_async)
                 self.push_assign(
                     Place::local(temp),
                     Rvalue::Aggregate(
@@ -430,12 +436,29 @@ impl<'a> FunctionBuilder<'a> {
             }
 
             HirExprKind::Await(future) => {
-                // Await is handled during async lowering
-                // For now, just evaluate the future
+                // Lower the future expression
                 let future_op = self.lower_expr(future);
-                let temp = self.new_temp(expr.ty.clone());
-                self.push_assign(Place::local(temp), Rvalue::Use(future_op));
-                Operand::Move(Place::local(temp))
+
+                // Create a temp to hold the awaited result
+                let result_temp = self.new_temp(expr.ty.clone());
+
+                // Create the resume block (where we continue after the await)
+                let resume_block = self.body.new_basic_block();
+
+                // Generate Yield terminator to suspend at this await point
+                // The coroutine transformation will convert this to proper state machine code
+                self.terminate(TerminatorKind::Yield {
+                    value: future_op,
+                    resume: resume_block,
+                });
+
+                // Switch to the resume block
+                self.current_block = resume_block;
+
+                // After resume, the awaited value is assumed to be in result_temp
+                // The coroutine transformation will handle actually loading the result
+                // For now, we return the temp (it will be filled in by the transformation)
+                Operand::Move(Place::local(result_temp))
             }
 
             HirExprKind::Cast { expr: inner, target_ty } => {

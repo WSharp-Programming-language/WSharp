@@ -1,5 +1,7 @@
 //! Command-line interface for the W# compiler.
 
+mod repl;
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -169,11 +171,20 @@ fn main() -> ExitCode {
         }
 
         Commands::Repl => {
-            println!("W# REPL v0.1.0");
-            println!("Type 'exit' or Ctrl+D to quit");
-            // TODO: Implement REPL
-            println!("REPL not yet implemented");
-            ExitCode::SUCCESS
+            match repl::Repl::new(cli.verbose) {
+                Ok(mut repl) => {
+                    if let Err(e) = repl.run() {
+                        eprintln!("error: {}", e);
+                        ExitCode::FAILURE
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: failed to initialize REPL: {}", e);
+                    ExitCode::FAILURE
+                }
+            }
         }
 
         Commands::Check { input } => {

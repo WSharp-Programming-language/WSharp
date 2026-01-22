@@ -13,10 +13,12 @@
 
 pub mod build;
 pub mod cfg;
+pub mod coroutine;
 pub mod mir;
 pub mod pretty;
 
 pub use build::*;
 pub use cfg::*;
+pub use coroutine::*;
 pub use mir::*;
 pub use pretty::*;

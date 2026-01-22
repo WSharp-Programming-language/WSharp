@@ -88,6 +88,10 @@ pub struct MirBody {
 
     /// Whether this is an async function.
     pub is_async: bool,
+
+    /// Coroutine metadata (populated after async transformation pass).
+    /// This is `Some` only after the coroutine transformation has been applied.
+    pub coroutine_info: Option<CoroutineInfo>,
 }
 
 impl MirBody {
@@ -106,6 +110,7 @@ impl MirBody {
             basic_blocks: IndexMap::new(),
             return_ty,
             is_async,
+            coroutine_info: None,
         }
     }
 
@@ -586,4 +591,168 @@ pub enum AggregateKind {
         body_id: BodyId,
         captures: Vec<Type>,
     },
+}
+
+// =============================================================================
+// Coroutine Support for Async/Await
+// =============================================================================
+
+/// Coroutine-specific metadata after async lowering.
+///
+/// This is attached to `MirBody` after the coroutine transformation pass
+/// converts an async function into a state machine.
+#[derive(Clone, Debug)]
+pub struct CoroutineInfo {
+    /// The layout of the coroutine state struct.
+    pub state_layout: CoroutineStateLayout,
+
+    /// Mapping from original locals to their indices in the state struct.
+    /// Only locals that are live across yield points are stored in state.
+    pub local_to_state_field: std::collections::HashMap<Local, usize>,
+
+    /// Information about each yield point in the coroutine.
+    pub yield_points: Vec<YieldPointInfo>,
+
+    /// Information about loops containing yield points.
+    pub loop_contexts: Vec<LoopContext>,
+
+    /// Nested coroutines (async closures) within this coroutine.
+    pub nested_coroutines: Vec<NestedCoroutineInfo>,
+
+    /// The poll function entry block (dispatch switch on __state).
+    pub poll_entry_block: BasicBlockId,
+
+    /// The block to jump to when returning Ready.
+    pub ready_block: BasicBlockId,
+
+    /// The block to jump to when returning Pending.
+    pub pending_block: BasicBlockId,
+}
+
+/// Layout of the coroutine state struct.
+#[derive(Clone, Debug)]
+pub struct CoroutineStateLayout {
+    /// Fields in the state struct: (name, type).
+    /// First two fields are always:
+    /// - `__state: u32` (current state index)
+    /// - `__result: T` (the result type for Ready)
+    /// Followed by saved locals.
+    pub fields: Vec<(String, Type)>,
+
+    /// Total size of the state struct in bytes (computed during codegen).
+    pub size_bytes: Option<usize>,
+}
+
+impl CoroutineStateLayout {
+    /// Create a new state layout with the standard __state and __result fields.
+    pub fn new(result_type: Type) -> Self {
+        Self {
+            fields: vec![
+                ("__state".to_string(), Type::Primitive(wsharp_types::PrimitiveType::U32)),
+                ("__result".to_string(), result_type),
+            ],
+            size_bytes: None,
+        }
+    }
+
+    /// Add a field for a saved local variable.
+    pub fn add_local_field(&mut self, name: String, ty: Type) -> usize {
+        let index = self.fields.len();
+        self.fields.push((name, ty));
+        index
+    }
+
+    /// Get the index of the __state field.
+    pub const fn state_field_index() -> usize {
+        0
+    }
+
+    /// Get the index of the __result field.
+    pub const fn result_field_index() -> usize {
+        1
+    }
+}
+
+/// Information about a single yield point (await expression).
+#[derive(Clone, Debug)]
+pub struct YieldPointInfo {
+    /// The basic block containing the yield.
+    pub yield_block: BasicBlockId,
+
+    /// The basic block to resume at after the yield.
+    pub resume_block: BasicBlockId,
+
+    /// The state index for this yield point (1..N).
+    /// State 0 is the initial state, MAX is the completed state.
+    pub state_index: u32,
+
+    /// Locals that are live across this yield point and need to be saved.
+    pub live_locals: Vec<Local>,
+
+    /// The operand being yielded (the future being awaited).
+    pub yielded_value: Option<Operand>,
+
+    /// The local where the awaited result is stored upon resume.
+    pub resume_result: Option<Local>,
+}
+
+/// Context for a loop that contains yield points.
+///
+/// When a loop contains await expressions, break and continue must be
+/// transformed into state machine transitions.
+#[derive(Clone, Debug)]
+pub struct LoopContext {
+    /// The state index for the loop header (where continue goes).
+    pub header_state: u32,
+
+    /// The state index for after the loop (where break goes).
+    pub exit_state: u32,
+
+    /// Basic blocks that are break targets for this loop.
+    pub break_targets: Vec<BasicBlockId>,
+
+    /// Basic blocks that are continue targets for this loop.
+    pub continue_targets: Vec<BasicBlockId>,
+
+    /// Yield points within this loop.
+    pub contained_yields: Vec<u32>,
+
+    /// Locals that are loop-carried (need to be saved on each iteration).
+    pub loop_carried_locals: Vec<Local>,
+}
+
+/// Information about a nested coroutine (async closure).
+#[derive(Clone, Debug)]
+pub struct NestedCoroutineInfo {
+    /// The BodyId of the nested closure's MIR body.
+    pub closure_body_id: BodyId,
+
+    /// The field index in the parent's state struct where this nested
+    /// coroutine's state is stored.
+    pub state_field_index: usize,
+
+    /// Variables captured by the closure from the outer scope.
+    pub captures: Vec<Local>,
+
+    /// Whether this nested coroutine has been transformed.
+    pub transformed: bool,
+}
+
+/// Result of polling a coroutine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollResult {
+    /// The coroutine is not yet complete and should be polled again.
+    Pending,
+    /// The coroutine has completed with a value.
+    Ready,
+}
+
+impl PollResult {
+    /// Get the discriminant value for this poll result.
+    pub const fn discriminant(self) -> u32 {
+        match self {
+            PollResult::Pending => 0,
+            PollResult::Ready => 1,
+        }
+    }
 }

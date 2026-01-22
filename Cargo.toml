@@ -56,6 +56,7 @@ rustc-hash = "2.1"
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
+rustyline = "15.0"
 
 # Testing
 pretty_assertions = "1.4"

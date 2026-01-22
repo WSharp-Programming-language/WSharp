@@ -1,6 +1,8 @@
 //! Control Flow Graph utilities.
 
-use crate::mir::{BasicBlockId, MirBody, TerminatorKind};
+use crate::mir::{
+    BasicBlockId, Local, MirBody, Operand, Place, Rvalue, StatementKind, TerminatorKind,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Represents the control flow graph structure.
@@ -316,4 +318,284 @@ pub fn reverse_post_order(body: &MirBody, cfg: &ControlFlowGraph) -> Vec<BasicBl
     let mut order = post_order(body, cfg);
     order.reverse();
     order
+}
+
+// =============================================================================
+// Live Variable Analysis
+// =============================================================================
+
+/// Live Variable Analysis result.
+///
+/// Computes which locals are "live" at each program point. A variable is live
+/// if it may be used before being redefined. This is a backward dataflow analysis.
+#[derive(Clone, Debug)]
+pub struct LiveVariableAnalysis {
+    /// Live variables at the entry of each block (before any statements execute).
+    pub live_in: HashMap<BasicBlockId, HashSet<Local>>,
+    /// Live variables at the exit of each block (after terminator).
+    pub live_out: HashMap<BasicBlockId, HashSet<Local>>,
+}
+
+impl LiveVariableAnalysis {
+    /// Compute live variable analysis for a MIR body.
+    ///
+    /// Uses iterative backward dataflow analysis with equations:
+    /// - live_out[B] = ∪ live_in[S] for all successors S of B
+    /// - live_in[B] = use[B] ∪ (live_out[B] - def[B])
+    pub fn compute(body: &MirBody, cfg: &ControlFlowGraph) -> Self {
+        let mut live_in: HashMap<BasicBlockId, HashSet<Local>> = HashMap::new();
+        let mut live_out: HashMap<BasicBlockId, HashSet<Local>> = HashMap::new();
+
+        // Initialize all blocks with empty sets
+        for &block_id in body.basic_blocks.keys() {
+            live_in.insert(block_id, HashSet::new());
+            live_out.insert(block_id, HashSet::new());
+        }
+
+        // Compute use and def sets for each block
+        let mut use_sets: HashMap<BasicBlockId, HashSet<Local>> = HashMap::new();
+        let mut def_sets: HashMap<BasicBlockId, HashSet<Local>> = HashMap::new();
+
+        for (&block_id, block) in &body.basic_blocks {
+            let (uses, defs) = Self::compute_use_def(block, body);
+            use_sets.insert(block_id, uses);
+            def_sets.insert(block_id, defs);
+        }
+
+        // Iterate until fixed point (backward analysis, so use post-order)
+        let order = post_order(body, cfg);
+        let mut changed = true;
+        while changed {
+            changed = false;
+
+            for &block_id in &order {
+                // live_out[B] = ∪ live_in[S] for all successors S
+                let mut new_live_out = HashSet::new();
+                for &succ in cfg.successors(block_id) {
+                    if let Some(succ_live_in) = live_in.get(&succ) {
+                        new_live_out.extend(succ_live_in.iter().copied());
+                    }
+                }
+
+                // live_in[B] = use[B] ∪ (live_out[B] - def[B])
+                let uses = use_sets.get(&block_id).cloned().unwrap_or_default();
+                let defs = def_sets.get(&block_id).cloned().unwrap_or_default();
+                let mut new_live_in: HashSet<Local> =
+                    new_live_out.difference(&defs).copied().collect();
+                new_live_in.extend(uses.iter());
+
+                // Check for changes
+                if new_live_out != *live_out.get(&block_id).unwrap() {
+                    live_out.insert(block_id, new_live_out);
+                    changed = true;
+                }
+                if new_live_in != *live_in.get(&block_id).unwrap() {
+                    live_in.insert(block_id, new_live_in);
+                    changed = true;
+                }
+            }
+        }
+
+        Self { live_in, live_out }
+    }
+
+    /// Compute the use and def sets for a basic block.
+    ///
+    /// - `use`: Variables used before being defined in this block
+    /// - `def`: Variables defined in this block
+    fn compute_use_def(
+        block: &crate::mir::BasicBlock,
+        _body: &MirBody,
+    ) -> (HashSet<Local>, HashSet<Local>) {
+        let mut uses = HashSet::new();
+        let mut defs = HashSet::new();
+
+        // Process statements in order
+        for stmt in &block.statements {
+            match &stmt.kind {
+                StatementKind::Assign(place, rvalue) => {
+                    // First, collect uses from rvalue (uses come before defs)
+                    Self::collect_rvalue_uses(rvalue, &mut uses, &defs);
+
+                    // Then record definition (but only the base local)
+                    if place.projection.is_empty() {
+                        defs.insert(place.local);
+                    } else {
+                        // For projections like _1.0, we use _1 but don't def it completely
+                        if !defs.contains(&place.local) {
+                            uses.insert(place.local);
+                        }
+                    }
+                }
+                StatementKind::StorageLive(local) => {
+                    // StorageLive doesn't use or def the value
+                    let _ = local;
+                }
+                StatementKind::StorageDead(local) => {
+                    // StorageDead doesn't use or def the value
+                    let _ = local;
+                }
+                StatementKind::Nop => {}
+            }
+        }
+
+        // Process terminator
+        if let Some(ref term) = block.terminator {
+            Self::collect_terminator_uses(&term.kind, &mut uses, &defs);
+        }
+
+        (uses, defs)
+    }
+
+    /// Collect locals used by an rvalue.
+    fn collect_rvalue_uses(rvalue: &Rvalue, uses: &mut HashSet<Local>, defs: &HashSet<Local>) {
+        match rvalue {
+            Rvalue::Use(op) => Self::collect_operand_uses(op, uses, defs),
+            Rvalue::Repeat(op, _) => Self::collect_operand_uses(op, uses, defs),
+            Rvalue::Ref(place, _) | Rvalue::AddressOf(place, _) => {
+                Self::collect_place_uses(place, uses, defs);
+            }
+            Rvalue::Len(place) => Self::collect_place_uses(place, uses, defs),
+            Rvalue::BinaryOp(_, op1, op2) | Rvalue::CheckedBinaryOp(_, op1, op2) => {
+                Self::collect_operand_uses(op1, uses, defs);
+                Self::collect_operand_uses(op2, uses, defs);
+            }
+            Rvalue::UnaryOp(_, op) => Self::collect_operand_uses(op, uses, defs),
+            Rvalue::NullaryOp(_, _) => {}
+            Rvalue::Cast(_, op, _) => Self::collect_operand_uses(op, uses, defs),
+            Rvalue::Discriminant(place) => Self::collect_place_uses(place, uses, defs),
+            Rvalue::Aggregate(_, ops) => {
+                for op in ops {
+                    Self::collect_operand_uses(op, uses, defs);
+                }
+            }
+            Rvalue::ShallowInitBox(op, _) => Self::collect_operand_uses(op, uses, defs),
+        }
+    }
+
+    /// Collect locals used by an operand.
+    fn collect_operand_uses(operand: &Operand, uses: &mut HashSet<Local>, defs: &HashSet<Local>) {
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => {
+                Self::collect_place_uses(place, uses, defs);
+            }
+            Operand::Constant(_) => {}
+        }
+    }
+
+    /// Collect locals used by a place (including projections).
+    fn collect_place_uses(place: &Place, uses: &mut HashSet<Local>, defs: &HashSet<Local>) {
+        // The base local is used
+        if !defs.contains(&place.local) {
+            uses.insert(place.local);
+        }
+
+        // Index projections also use a local
+        for elem in &place.projection {
+            if let crate::mir::PlaceElem::Index(idx) = elem {
+                if !defs.contains(idx) {
+                    uses.insert(*idx);
+                }
+            }
+        }
+    }
+
+    /// Collect locals used by a terminator.
+    fn collect_terminator_uses(
+        kind: &TerminatorKind,
+        uses: &mut HashSet<Local>,
+        defs: &HashSet<Local>,
+    ) {
+        match kind {
+            TerminatorKind::Goto { .. } => {}
+            TerminatorKind::SwitchInt { discr, .. } => {
+                Self::collect_operand_uses(discr, uses, defs);
+            }
+            TerminatorKind::Return => {
+                // Return uses the return place (_0)
+                if !defs.contains(&Local::RETURN_PLACE) {
+                    uses.insert(Local::RETURN_PLACE);
+                }
+            }
+            TerminatorKind::Unreachable => {}
+            TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            } => {
+                Self::collect_operand_uses(func, uses, defs);
+                for arg in args {
+                    Self::collect_operand_uses(arg, uses, defs);
+                }
+                // The destination is a def, but handled in next block
+                let _ = destination;
+            }
+            TerminatorKind::Drop { place, .. } => {
+                Self::collect_place_uses(place, uses, defs);
+            }
+            TerminatorKind::Assert { cond, .. } => {
+                Self::collect_operand_uses(cond, uses, defs);
+            }
+            TerminatorKind::Yield { value, .. } => {
+                Self::collect_operand_uses(value, uses, defs);
+            }
+        }
+    }
+
+    /// Get the set of locals that are live across a yield point.
+    ///
+    /// A local is live across a yield if it's in live_out of the yield block
+    /// AND live_in of the resume block (i.e., it's used after the yield).
+    pub fn locals_across_yield(
+        &self,
+        yield_block: BasicBlockId,
+        resume_block: BasicBlockId,
+    ) -> HashSet<Local> {
+        let live_at_yield = self.live_out.get(&yield_block).cloned().unwrap_or_default();
+        let live_at_resume = self.live_in.get(&resume_block).cloned().unwrap_or_default();
+
+        // Locals that are live at both points need to be saved
+        live_at_yield
+            .intersection(&live_at_resume)
+            .copied()
+            .collect()
+    }
+
+    /// Get all locals that are live at any yield point in the function.
+    ///
+    /// This is useful for determining which locals need to be stored in
+    /// the coroutine state struct.
+    pub fn all_locals_across_yields(&self, body: &MirBody, cfg: &ControlFlowGraph) -> HashSet<Local> {
+        let mut result = HashSet::new();
+
+        for (&block_id, block) in &body.basic_blocks {
+            if let Some(ref term) = block.terminator {
+                if let TerminatorKind::Yield { resume, .. } = term.kind {
+                    let locals = self.locals_across_yield(block_id, resume);
+                    result.extend(locals);
+                }
+            }
+        }
+
+        // Also need to consider locals that span multiple yield points via loops
+        // For now, this simple version captures the basics
+        let _ = cfg; // May be needed for more sophisticated analysis
+
+        result
+    }
+
+    /// Check if a local is live at the entry of a block.
+    pub fn is_live_at_entry(&self, local: Local, block: BasicBlockId) -> bool {
+        self.live_in
+            .get(&block)
+            .map_or(false, |set| set.contains(&local))
+    }
+
+    /// Check if a local is live at the exit of a block.
+    pub fn is_live_at_exit(&self, local: Local, block: BasicBlockId) -> bool {
+        self.live_out
+            .get(&block)
+            .map_or(false, |set| set.contains(&local))
+    }
 }

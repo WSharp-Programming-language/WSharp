@@ -4,6 +4,7 @@ use crate::codegen::CodeGenerator;
 use crate::error::{CodegenError, CodegenResult};
 use inkwell::context::Context;
 use inkwell::execution_engine::ExecutionEngine;
+use inkwell::targets::{InitializationConfig, Target};
 use inkwell::OptimizationLevel;
 use wsharp_mir::MirModule;
 
@@ -24,11 +25,16 @@ impl<'ctx> JitCompiler<'ctx> {
 
     /// Compile a MIR module and prepare it for JIT execution.
     pub fn compile(&mut self, mir_module: &MirModule) -> CodegenResult<()> {
+        // Initialize native target for JIT
+        Target::initialize_native(&InitializationConfig::default())
+            .map_err(|e| CodegenError::LlvmError(e))?;
+
         let mut codegen = CodeGenerator::new(self.context, &mir_module.name);
 
         // Set native target triple
         let triple = inkwell::targets::TargetMachine::get_default_triple();
-        codegen.set_target_triple(&triple.to_string());
+        let triple_str = triple.as_str().to_str().unwrap_or("unknown-unknown-unknown");
+        codegen.set_target_triple(triple_str);
 
         // Generate LLVM IR
         codegen.codegen_module(mir_module)?;

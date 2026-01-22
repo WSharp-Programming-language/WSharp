@@ -801,7 +801,7 @@ impl LoweringContext {
                 params,
                 return_type: _,
                 body,
-                is_async: _,
+                is_async,
             } => {
                 self.resolver.enter_function_scope();
 
@@ -816,6 +816,7 @@ impl LoweringContext {
                     params: hir_params,
                     body: Box::new(body_expr),
                     captures: Vec::new(), // TODO: capture analysis
+                    is_async: *is_async,
                 }
             }
 

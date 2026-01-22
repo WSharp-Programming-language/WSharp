@@ -74,7 +74,8 @@ impl<'ctx> AotCompiler<'ctx> {
     /// Compile a MIR module to LLVM IR.
     pub fn compile_to_ir(&self, mir_module: &MirModule) -> CodegenResult<Module<'ctx>> {
         let mut codegen = CodeGenerator::new(self.context, &mir_module.name);
-        codegen.set_target_triple(&self.target_triple.to_string());
+        let triple_str = self.target_triple.as_str().to_str().unwrap_or("unknown-unknown-unknown");
+        codegen.set_target_triple(triple_str);
         codegen.codegen_module(mir_module)?;
         Ok(codegen.into_module())
     }

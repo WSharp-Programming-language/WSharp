@@ -509,7 +509,7 @@ impl TypeChecker {
                 })
             }
 
-            HirExprKind::Lambda { params, body, captures: _ } => {
+            HirExprKind::Lambda { params, body, captures: _, is_async } => {
                 // Register parameter types
                 for param in params.iter_mut() {
                     let ty = if param.ty == Type::Unknown {
@@ -521,7 +521,25 @@ impl TypeChecker {
                     param.ty = ty;
                 }
 
+                // Set up return type tracking for the lambda
+                // Save old return type context and create fresh variable for lambda's return
+                let old_return_type = self.current_return_type.take();
+                let lambda_return_var = self.ctx.fresh_var();
+                self.current_return_type = Some(lambda_return_var.clone());
+
                 let body_ty = self.check_expr(body);
+
+                // Restore old return type context
+                self.current_return_type = old_return_type;
+
+                // Determine the actual return type:
+                // - If body type is Never (explicit returns), use the return type variable
+                // - Otherwise, use the body expression's type (implicit return)
+                let inferred_return = if body_ty == Type::Never {
+                    self.ctx.apply(&lambda_return_var)
+                } else {
+                    self.ctx.apply(&body_ty)
+                };
 
                 let param_types: Vec<ParamType> = params
                     .iter()
@@ -531,10 +549,12 @@ impl TypeChecker {
                     })
                     .collect();
 
+                // Note: For async lambdas, the FunctionType stores the inner return type (not Future<T>).
+                // The Future wrapping is handled by check_call based on the is_async flag.
                 Type::Function(FunctionType {
                     params: param_types,
-                    return_type: Box::new(self.ctx.apply(&body_ty)),
-                    is_async: false,
+                    return_type: Box::new(inferred_return),
+                    is_async: *is_async,
                 })
             }
 
@@ -809,7 +829,13 @@ impl TypeChecker {
                     }
                 }
 
-                self.ctx.apply(&ft.return_type)
+                let return_ty = self.ctx.apply(&ft.return_type);
+                // Async functions return Future<T>, not T directly
+                if ft.is_async {
+                    Type::Future(Box::new(return_ty))
+                } else {
+                    return_ty
+                }
             }
             Type::TypeVar(_) => {
                 // Create a fresh function type and unify

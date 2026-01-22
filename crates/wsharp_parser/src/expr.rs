@@ -729,8 +729,8 @@ impl Parser<'_> {
                 ))
             }
 
-            // Lambda
-            TokenKind::Fn | TokenKind::Async => {
+            // Lambda (fn syntax or closure syntax)
+            TokenKind::Fn | TokenKind::Async | TokenKind::Or | TokenKind::OrOr => {
                 self.parse_lambda()
             }
 
@@ -1078,11 +1078,24 @@ impl Parser<'_> {
     fn parse_lambda(&mut self) -> ParseResult<Expr> {
         let start = self.current_span();
         let is_async = self.match_token(&TokenKind::Async);
-        self.expect(TokenKind::Fn)?;
 
-        self.expect(TokenKind::LParen)?;
-        let params = self.parse_parameters()?;
-        self.expect(TokenKind::RParen)?;
+        // Parse parameters - supports both fn(params) and |params| or || syntax
+        let params = if self.match_token(&TokenKind::OrOr) {
+            // || - closure with no parameters
+            Vec::new()
+        } else if self.match_token(&TokenKind::Or) {
+            // |params| - closure with parameters between pipes
+            let params = self.parse_closure_params()?;
+            self.expect(TokenKind::Or)?;
+            params
+        } else {
+            // fn(params) - traditional function syntax
+            self.expect(TokenKind::Fn)?;
+            self.expect(TokenKind::LParen)?;
+            let params = self.parse_parameters()?;
+            self.expect(TokenKind::RParen)?;
+            params
+        };
 
         let return_type = if self.match_token(&TokenKind::Arrow) {
             Some(self.parse_type()?)
@@ -1111,6 +1124,41 @@ impl Parser<'_> {
             start.merge(self.current_span()),
             id,
         ))
+    }
+
+    /// Parse closure parameters (simpler than function parameters, types are optional)
+    fn parse_closure_params(&mut self) -> ParseResult<Vec<Parameter>> {
+        let mut params = Vec::new();
+
+        // Check if we're at the closing pipe already (empty params)
+        if self.check(&TokenKind::Or) {
+            return Ok(params);
+        }
+
+        loop {
+            let param_start = self.current_span();
+            let name = self.expect_ident()?;
+
+            // Type annotation is optional for closure params
+            let ty = if self.match_token(&TokenKind::Colon) {
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+
+            params.push(Parameter {
+                name,
+                ty,
+                default: None,
+                span: param_start.merge(self.current_span()),
+            });
+
+            if !self.match_token(&TokenKind::Comma) {
+                break;
+            }
+        }
+
+        Ok(params)
     }
 }
 
