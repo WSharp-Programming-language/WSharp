@@ -1,0 +1,21 @@
+[package]
+name = "wsharp_codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LLVM code generation for the W# programming language"
+
+[dependencies]
+wsharp_mir.workspace = true
+wsharp_types.workspace = true
+inkwell.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[features]
+default = ["aot", "jit"]
+aot = []
+jit = []
+
+[dev-dependencies]
+pretty_assertions.workspace = true

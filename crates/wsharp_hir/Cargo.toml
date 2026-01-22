@@ -1,0 +1,17 @@
+[package]
+name = "wsharp_hir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "High-level Intermediate Representation for the W# programming language"
+
+[dependencies]
+wsharp_lexer.workspace = true
+wsharp_ast.workspace = true
+wsharp_types.workspace = true
+thiserror.workspace = true
+typed-arena.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

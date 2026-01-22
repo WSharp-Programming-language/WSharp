@@ -1,0 +1,26 @@
+[package]
+name = "wsharp_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line interface for the W# programming language compiler"
+
+[[bin]]
+name = "wsharp"
+path = "src/main.rs"
+
+[dependencies]
+wsharp_driver.workspace = true
+wsharp_lexer.workspace = true
+wsharp_parser.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+default = ["jit"]
+jit = ["wsharp_driver/jit"]
+
+[dev-dependencies]
+pretty_assertions.workspace = true

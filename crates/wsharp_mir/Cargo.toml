@@ -1,0 +1,16 @@
+[package]
+name = "wsharp_mir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mid-level Intermediate Representation for the W# programming language"
+
+[dependencies]
+wsharp_hir.workspace = true
+wsharp_types.workspace = true
+thiserror.workspace = true
+indexmap.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

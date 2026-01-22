@@ -1,0 +1,13 @@
+[package]
+name = "wsharp_lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lexical analyzer for the W# programming language"
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

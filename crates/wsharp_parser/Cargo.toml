@@ -1,0 +1,15 @@
+[package]
+name = "wsharp_parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Parser for the W# programming language"
+
+[dependencies]
+wsharp_lexer.workspace = true
+wsharp_ast.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

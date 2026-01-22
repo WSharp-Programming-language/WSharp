@@ -1,0 +1,13 @@
+[package]
+name = "wsharp_stdlib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standard library for the W# programming language"
+
+[dependencies]
+wsharp_runtime.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
