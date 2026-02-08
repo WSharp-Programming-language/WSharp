@@ -74,8 +74,27 @@ impl<'ctx> CodeGenerator<'ctx> {
         &self.module
     }
 
+    /// Check if a MIR module uses any thread intrinsics.
+    fn uses_thread_intrinsics(mir_module: &MirModule) -> bool {
+        for body in mir_module.bodies.values() {
+            for block in body.basic_blocks.values() {
+                if let Some(ref term) = block.terminator {
+                    if let TerminatorKind::Call { func: Operand::Constant(Constant::Intrinsic(_)), .. } = &term.kind {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Generate code for an entire MIR module.
     pub fn codegen_module(&mut self, mir_module: &MirModule) -> CodegenResult<()> {
+        // Declare thread runtime FFI symbols only if intrinsics are used
+        if Self::uses_thread_intrinsics(mir_module) {
+            self.declare_thread_runtime();
+        }
+
         // First pass: declare all functions and poll functions for async
         for (&body_id, body) in &mir_module.bodies {
             if body.is_async && body.coroutine_info.is_some() {
@@ -477,6 +496,91 @@ impl<'ctx> CodeGenerator<'ctx> {
     // Executor Runtime Integration
     // =========================================================================
 
+    /// Declare the thread runtime functions.
+    ///
+    /// These are extern "C" functions from wsharp_runtime that will be linked
+    /// for thread spawning, mutex, and thread state support.
+    pub fn declare_thread_runtime(&self) {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i32_ty = self.context.i32_type();
+        let void_ty = self.context.void_type();
+
+        // wsharp_thread_spawn_gc(fn_ptr: ptr) -> ptr
+        self.module.add_function(
+            "wsharp_thread_spawn_gc",
+            ptr_ty.fn_type(&[ptr_ty.into()], false),
+            None,
+        );
+
+        // wsharp_mutex_new(initial: i32) -> ptr
+        self.module.add_function(
+            "wsharp_mutex_new",
+            ptr_ty.fn_type(&[i32_ty.into()], false),
+            None,
+        );
+
+        // wsharp_mutex_lock(ptr: ptr, thread_id: i32) -> void
+        self.module.add_function(
+            "wsharp_mutex_lock",
+            void_ty.fn_type(&[ptr_ty.into(), i32_ty.into()], false),
+            None,
+        );
+
+        // wsharp_mutex_unlock(ptr: ptr) -> void
+        self.module.add_function(
+            "wsharp_mutex_unlock",
+            void_ty.fn_type(&[ptr_ty.into()], false),
+            None,
+        );
+
+        // wsharp_mutex_destroy(ptr: ptr) -> void
+        self.module.add_function(
+            "wsharp_mutex_destroy",
+            void_ty.fn_type(&[ptr_ty.into()], false),
+            None,
+        );
+
+        // wsharp_thread_state_new(initial: i32) -> ptr
+        self.module.add_function(
+            "wsharp_thread_state_new",
+            ptr_ty.fn_type(&[i32_ty.into()], false),
+            None,
+        );
+
+        // wsharp_thread_state_get(ptr: ptr) -> i32
+        self.module.add_function(
+            "wsharp_thread_state_get",
+            i32_ty.fn_type(&[ptr_ty.into()], false),
+            None,
+        );
+
+        // wsharp_thread_state_set(ptr: ptr, val: i32) -> void
+        self.module.add_function(
+            "wsharp_thread_state_set",
+            void_ty.fn_type(&[ptr_ty.into(), i32_ty.into()], false),
+            None,
+        );
+
+        // Auto-injected lifecycle functions
+        self.module.add_function(
+            "wsharp_thread_join_all",
+            void_ty.fn_type(&[], false),
+            None,
+        );
+
+        self.module.add_function(
+            "wsharp_gc_daemon_start",
+            void_ty.fn_type(&[], false),
+            None,
+        );
+
+        self.module.add_function(
+            "wsharp_gc_daemon_stop",
+            void_ty.fn_type(&[], false),
+            None,
+        );
+    }
+
     /// Declare the executor runtime functions.
     ///
     /// These are extern "C" functions from wsharp_runtime that will be linked
@@ -851,6 +955,13 @@ impl<'a, 'ctx> FunctionContext<'a, 'ctx> {
             let name = format!("bb{}", block_id.0);
             let bb = self.context().append_basic_block(self.func, &name);
             self.blocks.insert(block_id, bb);
+        }
+
+        // If this is main, start the GC daemon
+        if self.body.name == "main" {
+            if let Some(start_fn) = self.codegen.module.get_function("wsharp_gc_daemon_start") {
+                self.builder().build_call(start_fn, &[], "gc_start")?;
+            }
         }
 
         // Jump from entry to the first MIR block
@@ -1248,6 +1359,16 @@ impl<'a, 'ctx> FunctionContext<'a, 'ctx> {
             }
 
             TerminatorKind::Return => {
+                // If this is main, stop the GC daemon and join all threads before returning
+                if self.body.name == "main" {
+                    if let Some(stop_fn) = self.codegen.module.get_function("wsharp_gc_daemon_stop") {
+                        self.builder().build_call(stop_fn, &[], "gc_stop")?;
+                    }
+                    if let Some(join_fn) = self.codegen.module.get_function("wsharp_thread_join_all") {
+                        self.builder().build_call(join_fn, &[], "join_all")?;
+                    }
+                }
+
                 let return_place = self.locals[&Local::RETURN_PLACE];
                 let return_ty = self.codegen.llvm_type(&self.body.return_ty)?;
                 let return_val = self.builder().build_load(return_ty, return_place, "retval")?;
@@ -1969,6 +2090,14 @@ impl<'a, 'ctx> FunctionContext<'a, 'ctx> {
                 let ptr_ty = self.context().ptr_type(AddressSpace::default());
                 Ok(ptr_ty.const_null().into())
             }
+            Constant::Intrinsic(name) => {
+                let ffi_name = intrinsic_to_ffi_name(name);
+                if let Some(func) = self.codegen.module.get_function(&ffi_name) {
+                    Ok(func.as_global_value().as_pointer_value().into())
+                } else {
+                    Err(CodegenError::UndefinedFunction(ffi_name))
+                }
+            }
         }
     }
 
@@ -2087,5 +2216,20 @@ impl<'a, 'ctx> FunctionContext<'a, 'ctx> {
         }
 
         Ok(ptr)
+    }
+}
+
+/// Map a W# intrinsic name to its FFI symbol name.
+fn intrinsic_to_ffi_name(name: &str) -> String {
+    match name {
+        "thread_spawn" => "wsharp_thread_spawn_gc".to_string(),
+        "mutex_new" => "wsharp_mutex_new".to_string(),
+        "mutex_lock" => "wsharp_mutex_lock".to_string(),
+        "mutex_unlock" => "wsharp_mutex_unlock".to_string(),
+        "mutex_destroy" => "wsharp_mutex_destroy".to_string(),
+        "thread_state_new" => "wsharp_thread_state_new".to_string(),
+        "thread_state_get" => "wsharp_thread_state_get".to_string(),
+        "thread_state_set" => "wsharp_thread_state_set".to_string(),
+        _ => format!("wsharp_{name}"),
     }
 }

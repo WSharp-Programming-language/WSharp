@@ -484,6 +484,38 @@ impl<'a> FunctionBuilder<'a> {
                 });
                 Operand::const_int(*code as i128, http_type)
             }
+
+            HirExprKind::IntrinsicCall { name, args } => {
+                let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let result_ty = Self::intrinsic_return_type(name);
+                let dest = self.new_temp(result_ty);
+                let next_block = self.body.new_basic_block();
+
+                self.terminate(TerminatorKind::Call {
+                    func: Operand::Constant(Constant::Intrinsic(name.clone())),
+                    args: arg_ops,
+                    destination: Place::local(dest),
+                    target: Some(next_block),
+                });
+
+                self.current_block = next_block;
+                Operand::Move(Place::local(dest))
+            }
+        }
+    }
+
+    /// Map an intrinsic name to its return type.
+    fn intrinsic_return_type(name: &str) -> Type {
+        match name {
+            // Returns opaque pointer (thread handle)
+            "thread_spawn" => Type::Primitive(PrimitiveType::I64),
+            // Returns opaque pointer (mutex/state handle)
+            "mutex_new" | "thread_state_new" => Type::Primitive(PrimitiveType::I64),
+            // Returns i32 value
+            "thread_state_get" => Type::Primitive(PrimitiveType::I32),
+            // Void operations
+            "mutex_lock" | "mutex_unlock" | "mutex_destroy" | "thread_state_set" => Type::Unit,
+            _ => Type::Unit,
         }
     }
 

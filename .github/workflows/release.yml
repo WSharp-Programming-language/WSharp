@@ -1,0 +1,189 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  LLVM_VERSION: "18"
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: W# ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  build-linux:
+    name: Build (Linux)
+    needs: create-release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh ${{ env.LLVM_VERSION }}
+          sudo apt-get install -y llvm-${{ env.LLVM_VERSION }}-dev libpolly-${{ env.LLVM_VERSION }}-dev
+
+      - name: Set LLVM environment
+        run: |
+          echo "LLVM_SYS_181_PREFIX=/usr/lib/llvm-${{ env.LLVM_VERSION }}" >> $GITHUB_ENV
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release --features jit
+
+      - name: Create tarball
+        run: |
+          mkdir -p dist
+          cp target/release/wsharp dist/
+          cp README.md LICENSE dist/ 2>/dev/null || true
+          cd dist && tar -czvf ../wsharp-linux-x86_64.tar.gz *
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./wsharp-linux-x86_64.tar.gz
+          asset_name: wsharp-linux-x86_64.tar.gz
+          asset_content_type: application/gzip
+
+  build-macos-arm:
+    name: Build (macOS ARM64)
+    needs: create-release
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM
+        run: |
+          brew install llvm@18
+
+      - name: Set LLVM environment
+        run: |
+          echo "LLVM_SYS_181_PREFIX=$(brew --prefix llvm@18)" >> $GITHUB_ENV
+          echo "$(brew --prefix llvm@18)/bin" >> $GITHUB_PATH
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release --features jit
+
+      - name: Create tarball
+        run: |
+          mkdir -p dist
+          cp target/release/wsharp dist/
+          cp README.md LICENSE dist/ 2>/dev/null || true
+          cd dist && tar -czvf ../wsharp-macos-arm64.tar.gz *
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./wsharp-macos-arm64.tar.gz
+          asset_name: wsharp-macos-arm64.tar.gz
+          asset_content_type: application/gzip
+
+  build-macos-x86:
+    name: Build (macOS x86_64)
+    needs: create-release
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM
+        run: |
+          brew install llvm@18
+
+      - name: Set LLVM environment
+        run: |
+          echo "LLVM_SYS_181_PREFIX=$(brew --prefix llvm@18)" >> $GITHUB_ENV
+          echo "$(brew --prefix llvm@18)/bin" >> $GITHUB_PATH
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release --features jit
+
+      - name: Create tarball
+        run: |
+          mkdir -p dist
+          cp target/release/wsharp dist/
+          cp README.md LICENSE dist/ 2>/dev/null || true
+          cd dist && tar -czvf ../wsharp-macos-x86_64.tar.gz *
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./wsharp-macos-x86_64.tar.gz
+          asset_name: wsharp-macos-x86_64.tar.gz
+          asset_content_type: application/gzip
+
+  build-windows:
+    name: Build (Windows)
+    needs: create-release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM
+        run: |
+          choco install llvm --version=18.1.8 -y
+        shell: pwsh
+
+      - name: Set LLVM environment
+        run: |
+          echo "LLVM_SYS_181_PREFIX=C:\Program Files\LLVM" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release --features jit
+
+      - name: Create zip
+        run: |
+          mkdir dist
+          copy target\release\wsharp.exe dist\
+          if (Test-Path README.md) { copy README.md dist\ }
+          if (Test-Path LICENSE) { copy LICENSE dist\ }
+          Compress-Archive -Path dist\* -DestinationPath wsharp-windows-x86_64.zip
+        shell: pwsh
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./wsharp-windows-x86_64.zip
+          asset_name: wsharp-windows-x86_64.zip
+          asset_content_type: application/zip

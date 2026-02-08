@@ -207,6 +207,12 @@ pub enum HirExprKind {
 
     /// HTTP status literal.
     HttpStatus(u16),
+
+    /// Intrinsic runtime call (e.g., thread_spawn, mutex_new).
+    IntrinsicCall {
+        name: String,
+        args: Vec<HirExpr>,
+    },
 }
 
 /// A block of statements with optional result.

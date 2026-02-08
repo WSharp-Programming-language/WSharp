@@ -445,6 +445,9 @@ pub enum Constant {
 
     /// Null pointer.
     Null,
+
+    /// Runtime intrinsic function reference (e.g., "thread_spawn").
+    Intrinsic(String),
 }
 
 /// An rvalue (right-hand side of an assignment).

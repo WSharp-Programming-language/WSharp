@@ -605,10 +605,36 @@ impl LoweringContext {
                 operand: Box::new(self.lower_expr(operand)),
             },
 
-            ExprKind::Call { callee, args } => HirExprKind::Call {
-                callee: Box::new(self.lower_expr(callee)),
-                args: args.iter().map(|a| self.lower_expr(a)).collect(),
-            },
+            ExprKind::Call { callee, args } => {
+                // Check for intrinsic thread runtime calls
+                if let ExprKind::Ident(ident) = &callee.kind {
+                    const INTRINSICS: &[&str] = &[
+                        "thread_spawn",
+                        "mutex_new",
+                        "mutex_lock",
+                        "mutex_unlock",
+                        "mutex_destroy",
+                        "thread_state_new",
+                        "thread_state_get",
+                        "thread_state_set",
+                    ];
+                    if INTRINSICS.contains(&ident.name.as_str()) {
+                        return HirExpr {
+                            id: self.fresh_hir_id(),
+                            kind: HirExprKind::IntrinsicCall {
+                                name: ident.name.clone(),
+                                args: args.iter().map(|a| self.lower_expr(a)).collect(),
+                            },
+                            ty: Type::Unknown,
+                            span: expr.span,
+                        };
+                    }
+                }
+                HirExprKind::Call {
+                    callee: Box::new(self.lower_expr(callee)),
+                    args: args.iter().map(|a| self.lower_expr(a)).collect(),
+                }
+            }
 
             ExprKind::MethodCall {
                 receiver,

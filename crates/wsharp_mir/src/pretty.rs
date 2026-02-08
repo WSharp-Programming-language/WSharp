@@ -275,6 +275,7 @@ impl<'a> MirPrinter<'a> {
             Constant::Unit => "const ()".to_string(),
             Constant::Function(id) => format!("const fn#{}", id.0),
             Constant::Null => "const null".to_string(),
+            Constant::Intrinsic(name) => format!("intrinsic @{name}"),
         }
     }
 

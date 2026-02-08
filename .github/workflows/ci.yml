@@ -1,0 +1,200 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  LLVM_VERSION: "18"
+
+jobs:
+  build-linux:
+    name: Build (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh ${{ env.LLVM_VERSION }}
+          sudo apt-get install -y llvm-${{ env.LLVM_VERSION }}-dev libpolly-${{ env.LLVM_VERSION }}-dev
+
+      - name: Set LLVM environment
+        run: |
+          echo "LLVM_SYS_181_PREFIX=/usr/lib/llvm-${{ env.LLVM_VERSION }}" >> $GITHUB_ENV
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build
+        run: cargo build --workspace --all-features
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-features -- -D warnings
+        continue-on-error: true
+
+      - name: Run tests
+        run: cargo test --workspace --all-features
+
+      - name: Build release
+        run: cargo build --release --features jit
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsharp-linux-x86_64
+          path: target/release/wsharp
+
+  build-macos:
+    name: Build (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM
+        run: |
+          brew install llvm@18
+
+      - name: Set LLVM environment
+        run: |
+          echo "LLVM_SYS_181_PREFIX=$(brew --prefix llvm@18)" >> $GITHUB_ENV
+          echo "$(brew --prefix llvm@18)/bin" >> $GITHUB_PATH
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --workspace --all-features
+
+      - name: Run tests
+        run: cargo test --workspace --all-features
+
+      - name: Build release
+        run: cargo build --release --features jit
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsharp-macos-arm64
+          path: target/release/wsharp
+
+  build-macos-x86:
+    name: Build (macOS x86_64)
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM
+        run: |
+          brew install llvm@18
+
+      - name: Set LLVM environment
+        run: |
+          echo "LLVM_SYS_181_PREFIX=$(brew --prefix llvm@18)" >> $GITHUB_ENV
+          echo "$(brew --prefix llvm@18)/bin" >> $GITHUB_PATH
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-x86-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-x86-cargo-
+
+      - name: Build
+        run: cargo build --workspace --all-features
+
+      - name: Run tests
+        run: cargo test --workspace --all-features
+
+      - name: Build release
+        run: cargo build --release --features jit
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsharp-macos-x86_64
+          path: target/release/wsharp
+
+  build-windows:
+    name: Build (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM
+        run: |
+          choco install llvm --version=18.1.8 -y
+        shell: pwsh
+
+      - name: Set LLVM environment
+        run: |
+          echo "LLVM_SYS_181_PREFIX=C:\Program Files\LLVM" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --workspace --all-features
+
+      - name: Run tests
+        run: cargo test --workspace --all-features
+
+      - name: Build release
+        run: cargo build --release --features jit
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsharp-windows-x86_64
+          path: target/release/wsharp.exe

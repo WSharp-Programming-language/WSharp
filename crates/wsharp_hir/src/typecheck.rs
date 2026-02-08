@@ -609,6 +609,21 @@ impl TypeChecker {
                     kind: HttpStatusTypeKind::Exact(*code),
                 })
             }
+
+            HirExprKind::IntrinsicCall { name, args } => {
+                // Type check arguments
+                for arg in args.iter_mut() {
+                    self.check_expr(arg);
+                }
+                // Return type based on intrinsic
+                match name.as_str() {
+                    "thread_spawn" | "mutex_new" | "thread_state_new" => {
+                        Type::Primitive(PrimitiveType::I64)
+                    }
+                    "thread_state_get" => Type::Primitive(PrimitiveType::I32),
+                    _ => Type::Unit,
+                }
+            }
         };
 
         expr.ty = ty.clone();

@@ -5,9 +5,16 @@ edition.workspace = true
 license.workspace = true
 description = "Runtime library for the W# programming language"
 
+[lib]
+crate-type = ["lib", "staticlib"]
+
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+
+[features]
+default = []
+thread-debug = []
 
 [dev-dependencies]
 pretty_assertions.workspace = true
